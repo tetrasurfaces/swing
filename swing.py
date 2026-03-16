@@ -13,10 +13,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
-# - For hardware/embodiment interfaces: Licensed under the Apache License, Version 2.0
-# with xAI amendments for safety and physical use. See http://www.apache.org/licenses/LICENSE-2.0
-# for details, with the following xAI-specific terms appended.
-
 # Copyright 2025 Tetrasurfaces
 
 # Licensed under the Apache License, Version 2.0 (the "License");
