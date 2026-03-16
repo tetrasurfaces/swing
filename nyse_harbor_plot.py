@@ -49,9 +49,10 @@ MAN_OFFSET_LONG     = 22
 EIGHTH_OFFSET_LONG  = 36
 
 # Minimum chain lengths before we even consider the structure
-MIN_CHAIN_SHORT     = 16
-MIN_CHAIN_LONG      = 52
-
+MIN_CHAIN_SHORT     = 12
+MIN_CHAIN_LONG      = 40
+activation_offset_short = MIN_CHAIN_SHORT // 4
+activation_offset_long  = MIN_CHAIN_LONG // 4
 # ==================== Helpers ====================
 def triplet_swings(df):
     highs = df["high"].values
@@ -70,9 +71,6 @@ def triplet_swings(df):
 def get_harbor_lines(df, debug=False):
     lines = []
     _, down_swings = triplet_swings(df)
-
-    activation_offset_short = MIN_CHAIN_SHORT // 16
-    activation_offset_long  = MIN_CHAIN_LONG // 52
 
     if debug:
         print(f"[PARAMS] min_chain_short={MIN_CHAIN_SHORT}, act_offset_short={activation_offset_short}")
@@ -258,9 +256,6 @@ def plot_chart(df, symbol, lines):
 
 def get_reversal_signals(df, lines):
     sig_list = []
-    activation_offset_short = MIN_CHAIN_SHORT // 3
-    activation_offset_long  = MIN_CHAIN_LONG // 3
-
     for line in lines:
         if line.get('strike_time') is None:
             continue
