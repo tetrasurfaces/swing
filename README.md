@@ -1,5 +1,6 @@
-Swing is dual-licensed under:
-- Apache License 2.0 (permissive — preferred for commercial/private use)
-- GNU GPL v3 or (at your option) any later version (copyleft — for open-source forks)
+Swing is licensed under the GNU General Public License v3 (or any later version).
 
-Choose whichever fits your needs. We recommend Apache 2.0 for proprietary trading applications.
+All development, use, modification, and distribution must comply with GPL v3.
+No Apache 2.0 license is granted for non-open-source or private development.
+
+For commercial, closed-source, or proprietary use licenses, please contact Tetrasurfaces via GitHub issues.
