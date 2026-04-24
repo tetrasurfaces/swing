@@ -1,6 +1,13 @@
-Swing is licensed under the GNU General Public License v3 (or any later version).
-
-All development, use, modification, and distribution must comply with GPL v3.
-No Apache 2.0 license is granted for non-open-source or private development.
-
-For commercial, closed-source, or proprietary use licenses, please contact Tetrasurfaces via GitHub issues.
+# PRIVATE AND CONFIDENTIAL
+# Copyright (c) 2025 Tetrasurfaces. All Rights Reserved.
+#
+# This file and all associated intellectual property (including harbor lines,
+# nested sailfish pattern recognition, swing chain logic, multi-timeframe
+# reversal systems, and trading models) are strictly confidential.
+#
+# Unauthorized distribution, disclosure, copying, or use is prohibited.
+# Mutual Non-Disclosure Agreement applies to all collaborators.
+#
+# For internal backup and development use only. Contact Tetrasurfaces via GitHub Issues for use.
+# Version: v14.11 - Nested Sailfish 1m
+# Last updated: 2026-04-23
