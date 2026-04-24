@@ -9,5 +9,4 @@
 # Mutual Non-Disclosure Agreement applies to all collaborators.
 #
 # For internal backup and development use only. Contact Tetrasurfaces via GitHub Issues for use.
-# Version: v14.11 - Nested Sailfish 1m
 # Last updated: 2026-04-23
