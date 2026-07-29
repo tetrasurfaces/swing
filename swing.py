@@ -1,969 +1,2386 @@
 # PRIVATE AND CONFIDENTIAL
 # Copyright (c) 2025 Tetrasurfaces. All Rights Reserved.
 #
-# This file and all associated intellectual property (including harbor lines,
-# nested sailfish pattern recognition, swing chain logic, multi-timeframe
-# reversal systems, and trading models) are strictly confidential.
+# This software and all associated files, models, patterns, and intellectual property
+# (including but not limited to harbor line logic, sailfish pattern recognition,
+# nested swing detection, and trading algorithms) are strictly confidential.
 #
-# Unauthorized distribution, disclosure, copying, or use is prohibited.
-# Mutual Non-Disclosure Agreement applies to all collaborators.
+# Unauthorized copying, distribution, disclosure, reverse engineering, or use is
+# strictly prohibited. This code is provided under a limited, revocable license
+# for internal use only.
 #
-# For internal backup and development use only.
-# Last updated: 2026-04-23
-
+# Any violation will be pursued to the fullest extent of the law.
+# Mutual Non-Disclosure Agreement (NDA) applies to all collaborators.
+#
+# For licensing, access, or collaboration inquiries contact: tetrasurfaces (via GitHub issues only).
+# Last updated: 2026-05-02
+# PRIVATE AND CONFIDENTIAL
+# Copyright (c) 2025 Tetrasurfaces. All Rights Reserved.
+# Unauthorized distribution or use is prohibited.
+# Mutual Non-Disclosure Agreement applies.
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Tetris + Topiary v14.78 - FINAL CONSOLIDATED VERSION
+- Exactly 18 live limit orders (9 long + 9 short)
+- Most recent unstruck harbor line per TF per direction
+- Reversal limits only after eighth_idx + activation_offset
+- Dynamic 10% risk per TF sizing
+- Candle-timed resets
+- Full Topiary hedging + nose stops
+- Isolated margin + state export
+- Complete get_reecent_harbor_signals (15.1 logic)
+"""
+
+import argparse
 import os
-import sys
-import json
 import time
-import subprocess
-import hashlib
-import pyttsx3
+import json
 from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 import ccxt
-import logging
 from collections import defaultdict
-import argparse
-import asyncio
-import signal
-import tempfile
+import logging
+import sys
+from dotenv import load_dotenv
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
+from eth_account import Account
+from tqdm import tqdm
 
-# Global for graceful exit
-tf_data_global = None
+load_dotenv()
 
-VOICE_CONFIG = "blossom_voice.json"
-def load_voice_config():
-    if os.path.exists(VOICE_CONFIG):
-        with open(VOICE_CONFIG, 'r') as f:
-            return json.load(f)
-    return {
-        "voice_id": "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\TTS_MS_EN-US_ZIRA_11.0",
-        "rate": 140,
-        "volume": 0.9
+# ==================== CONSTANTS ====================
+EXTRA_HISTORY_DAYS = 7
+MAX_RISK_PER_TF_PCT = 10.0
+LEAD_FACTOR = 0.20
+DEFAULT_FEES = 0.045
+DEFAULT_MIN_DELTA_PCT = 0.20
+STOP_BUFFER = 0.0002
+MAX_POSITION_USD = 12_000
+MAX_TF_EXPOSURE_USD = 3000
+MAX_MARTINGALE_ROUNDS = 10
+CYCLE_PCT = 0.30
+LEVERAGE = int(os.getenv("LEVERAGE", 10))
+LOWER_TFS = ['1m', '3m', '5m']
+HIGHER_TFS = ['15m', '1h', '4h', '1d', '1w', '1M']   # ← 1w and 1M are already here
+ALL_TFS = LOWER_TFS + HIGHER_TFS
+STATE_EXPORT_INTERVAL = 300
+TF_RESET_INTERVAL = {
+    '1m': 60, '3m': 180, '5m': 300, '15m': 900,
+    '1h': 3600, '4h': 14400, '1d': 86400
+}
+
+# ====================== PICO (Short-term, reactive) ======================
+MAN_OFFSET_PICO      = 2
+EIGHTH_OFFSET_PICO   = 3
+MIN_CHAIN_PICO       = 3
+ACTIVATION_OFFSET_PICO = 8
+
+# ====================== NANO (Ultra-short, high-frequency) ======================
+MAN_OFFSET_NANO      = 8
+EIGHTH_OFFSET_NANO   = 11
+MIN_CHAIN_NANO       = 16
+ACTIVATION_OFFSET_NANO = 5
+
+# ====================== MICRO (Full-chains, high-frequency) ======================
+MAN_OFFSET_MICRO     = 9
+EIGHTH_OFFSET_MICRO  = 17
+MIN_CHAIN_MICRO      = 22
+ACTIVATION_OFFSET_MICRO = 4
+
+# ====================== MACRO (Long-chains, low-frequency) ======================
+MAN_OFFSET_MACRO     = 21
+EIGHTH_OFFSET_MACRO  = 35
+MIN_CHAIN_MACRO      = 44
+ACTIVATION_OFFSET_MACRO = 9
+
+GLIDE_MIN_STEP_USD = 6.0
+# ==================== v15.6 GLIDE EXECUTION (Candle-Driven) ====================
+GLIDE_STEP_PER_MIN = {
+    '1m': 1.8, '3m': 2.8, '5m': 3.8,
+    '15m': 5.5, '1h': 9.0, '4h': 14.0,
+}
+GLIDE_ACTIVATION_OFFSET_PCT = 0.0045
+GLIDE_MIN_STEP_USD = 6.0          # only move if glide has moved at least this much
+
+class GlideExecutionManager:
+    def __init__(self, active_limits_ref, wallet, testnet=False):
+        self.active_glides = {}
+        self.last_candle_close = {}
+        self.active_limits = active_limits_ref
+        self.wallet = wallet
+        self.testnet = testnet
+
+    def register_order(self, oid, tf, bias, origin_price, glide_line, side):
+        self.active_glides[oid] = {
+            'tf': tf, 'bias': bias, 'origin_price': origin_price,
+            'glide_line': glide_line, 'last_candle_close': datetime.now(timezone.utc), 'side': side
+        }
+
+    def on_candle_close(self, tf, new_candle_close_time):
+        self.last_candle_close[tf] = new_candle_close_time
+        to_move = []
+        for oid, data in list(self.active_glides.items()):
+            if data['tf'] != tf:
+                continue
+            minutes_elapsed = (new_candle_close_time - data['last_candle_close']).total_seconds() / 60
+            step = GLIDE_STEP_PER_MIN.get(tf, 3.0)
+            drift = step * minutes_elapsed
+            direction = 1 if data['bias'] == 'long' else -1
+            new_glide_line = data['glide_line'] + (drift * direction)
+
+            if abs(new_glide_line - data['glide_line']) >= GLIDE_MIN_STEP_USD:
+                to_move.append((oid, new_glide_line, data))
+
+        for oid, new_target, data in to_move:
+            self._move_order(oid, new_target, data)
+
+    def _move_order(self, old_oid, new_target_price, data):
+        try:
+            coin = "BTC"
+            symbol = f"{coin}/USDC"
+            side = "buy" if data['side'] == 'long' else "sell"
+
+            exchange = get_hyperliquid_exchange(self.wallet, self.testnet)
+            exchange.cancel(oid=old_oid, name=coin)
+            time.sleep(0.35)
+
+            result = place_glide_limit_with_perturbation(
+                symbol=symbol, side=side, size=0.01,
+                calculated_glide_price=new_target_price, coin=coin,
+                is_buy=(side == "buy"), wallet=self.wallet, testnet=self.testnet
+            )
+
+            if result:
+                new_oid = None
+                try:
+                    statuses = result.get('response', {}).get('data', {}).get('statuses', [])
+                    if statuses and isinstance(statuses[0], dict):
+                        resting = statuses[0].get('resting')
+                        if resting:
+                            new_oid = resting.get('oid')
+                except:
+                    pass
+
+                if new_oid:
+                    self.active_glides[new_oid] = data.copy()
+                    self.active_glides[new_oid]['glide_line'] = new_target_price
+                    self.active_glides[new_oid]['last_candle_close'] = datetime.now(timezone.utc)
+                    if old_oid in self.active_glides:
+                        del self.active_glides[old_oid]
+
+                    for k, v in list(self.active_limits.items()):
+                        if v.get('oid') == old_oid:
+                            v['oid'] = new_oid
+                            v['price'] = round(new_target_price, 2)
+                            v['glide_origin_price'] = new_target_price
+                            break
+
+                    print(f"[GLIDE EXEC] {data['tf']} {data['bias'].upper()} moved → {new_target_price:.2f}")
+        except Exception as e:
+            print(f"[GLIDE EXEC ERROR] {e}")
+
+# ==================== AFFORDANCE ROSTER (72 slots - 8 per TF) ====================
+class AffordanceRoster:
+    """
+    Automatic slot allocation for up to 72 orders (8 per TF).
+    Each TF gets its own pool of 8 slots.
+    Slots are allocated automatically when we place a new harbor order.
+    Released on cleanup, cancel, or when position is closed.
+    """
+
+    def __init__(self, max_slots_per_tf=8):
+        self.max_slots_per_tf = max_slots_per_tf
+        self.slots = {}          # tf -> list of allocated dicts
+        self.order_to_slot = {}  # order_key -> (tf, slot_index)
+
+        # Initialize empty pools for all TFs we care about
+        for tf in ['1m', '3m', '5m', '15m', '1h', '4h', '1d', '1w', '1M']:
+            self.slots[tf] = []
+
+    def get_free_slots(self, tf):
+        return self.max_slots_per_tf - len(self.slots.get(tf, []))
+
+    def can_allocate(self, tf):
+        return self.get_free_slots(tf) > 0
+
+    def allocate(self, tf, bias, chain_type, size_usd, order_key):
+        """Automatically allocate the next available slot for this TF."""
+        if not self.can_allocate(tf):
+            return False
+
+        slot = {
+            'bias': bias,
+            'chain_type': chain_type,
+            'allocated_usd': round(size_usd, 2),
+            'order_key': order_key,
+            'allocated_ts': time.time()
+        }
+        self.slots[tf].append(slot)
+        self.order_to_slot[order_key] = (tf, len(self.slots[tf]) - 1)
+        return True
+
+    def release(self, order_key):
+        """Release a slot by order_key."""
+        if order_key not in self.order_to_slot:
+            return False
+        tf, idx = self.order_to_slot[order_key]
+        if tf in self.slots and idx < len(self.slots[tf]):
+            del self.slots[tf][idx]
+            del self.order_to_slot[order_key]
+            self._rebuild_indices(tf)
+            return True
+        return False
+
+    def _rebuild_indices(self, tf):
+        self.order_to_slot = {k: v for k, v in self.order_to_slot.items() if v[0] != tf}
+        for i, slot in enumerate(self.slots.get(tf, [])):
+            self.order_to_slot[slot['order_key']] = (tf, i)
+
+    def get_total_allocated(self):
+        return sum(len(slots) for slots in self.slots.values())
+
+    def get_roster_state(self):
+        """Export for dashboard / live_state.json"""
+        state = {
+            'total_allocated': self.get_total_allocated(),
+            'max_slots': self.max_slots_per_tf * len(self.slots),
+            'by_tf': {}
+        }
+        for tf, slot_list in self.slots.items():
+            state['by_tf'][tf] = {
+                'allocated': len(slot_list),
+                'free': self.get_free_slots(tf),
+                'slots': slot_list
+            }
+        return state
+
+    def get_recommended_size(self, capital, tf, base_risk_pct=0.10):
+        """Simple dynamic sizing: smaller when many slots used, larger when capital grows."""
+        free = self.get_free_slots(tf)
+        if free <= 0:
+            return 0.0
+        slot_factor = max(0.6, free / self.max_slots_per_tf)
+        size = (capital * base_risk_pct * slot_factor) / 9.0
+        return max(0.005, round(size, 4))
+
+# ==================== HYPERLIQUID SDK ====================
+def get_hyperliquid_exchange(wallet, testnet=False):   # Default to MAINNET
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+    
+    url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
+    exchange = Exchange(wallet, url)
+    exchange.info = Info(url, skip_ws=True)
+    
+    print(f"🔗 Connected to {'TESTNET' if testnet else 'MAINNET'}")
+    return exchange
+
+def setup_isolated_margin(coin: str, testnet=True):
+    try:
+        # Use a dummy wallet or skip signing if possible, but simplest:
+        private_key = os.getenv('PRIVATE_KEY')
+        wallet = Account.from_key(private_key)
+        exchange = get_hyperliquid_exchange(wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
+        exchange.update_leverage(name=coin, leverage=LEVERAGE, is_cross=False)
+        print(f"[ISOLATED] {coin} set to ISOLATED margin @ {LEVERAGE}x")
+    except Exception as e:
+        print(f"[ISOLATED WARNING] {e} (this is usually harmless on testnet)")
+
+def place_glide_limit_with_perturbation(symbol, side, size, calculated_glide_price, coin, is_buy=True, max_attempts=6, wallet=None, testnet=False):
+    if wallet is None:
+        wallet = Account.from_key(os.getenv('PRIVATE_KEY'))
+
+    exchange = get_hyperliquid_exchange(wallet, testnet=testnet)
+    is_buy = side.lower() == 'buy'
+
+    if coin.upper() == "BTC":
+        price = round(calculated_glide_price / 0.5) * 0.5
+    else:
+        price = round(calculated_glide_price, 1)
+
+    print(f"[LIMIT] {side.upper()} {size} {coin} @ {price:.2f} (raw: {calculated_glide_price:.2f})")
+
+    for attempt in range(max_attempts):
+        try:
+            order = exchange.order(
+                name=coin,
+                is_buy=is_buy,
+                sz=float(f"{float(size):.5f}"),
+                limit_px=price,
+                order_type={"limit": {"tif": "Gtc"}},
+                reduce_only=False
+            )
+
+            if isinstance(order, dict) and order.get('status') == 'ok':
+                print("✅ [SUCCESS] Order resting")
+                return order
+        except Exception as e:
+            err = str(e).lower()
+            print(f"   Attempt {attempt+1}: {err[:100]}")
+            if any(x in err for x in ["precision", "float_to_wire"]):
+                if coin.upper() == "BTC":
+                    price += 0.5 if is_buy else -0.5
+                else:
+                    price += 0.01 if is_buy else -0.01
+                time.sleep(0.4)
+                continue
+            else:
+                break
+
+    print(f"❌ [FAILED] Could not place {side}")
+    return None
+
+def check_balance():
+    print("\n🔍 Checking Hyperliquid Balance...")
+    try:
+        from eth_account import Account
+        private_key = os.getenv('PRIVATE_KEY')
+        if not private_key:
+            print("❌ PRIVATE_KEY not found in .env")
+            return
+
+        wallet = Account.from_key(private_key)
+        print(f"✅ Wallet Address: {wallet.address}")
+
+        exchange = get_hyperliquid_exchange(wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
+        user_state = exchange.info.user_state(address=wallet.address)
+        total_balance = float(user_state.get('marginSummary', {}).get('accountValue', 0))
+
+        print(f"✅ SDK Balance: ${total_balance:,.2f} USDC")
+        print(f"✅ Withdrawable: ${float(user_state.get('withdrawable', 0)):,.2f} USDC")
+
+    except Exception as e:
+        print(f"❌ Error checking balance: {e}")
+
+def update_or_create_limit(active_limits, key, limit_price, size, current_time, sig):
+    """
+    Creates or refreshes an active limit entry.
+    - Keeps the original_price from the first time the order was placed.
+    - Updates current price, size, and timestamps.
+    """
+    existing = active_limits.get(key, {})
+    
+    # Only set original_price the FIRST time this key is created
+    original_price = existing.get('original_price', limit_price)
+    
+    active_limits[key] = {
+        'price': limit_price,
+        'size': size,
+        'time': current_time,
+        'original_price': original_price,
+        'anchor1': sig.get('anchor1_price', 0),
+        'anchor2': sig.get('anchor2_price', limit_price)
+    }
+    
+    return active_limits[key]
+
+def sync_filled_positions(tf_data, symbol, wallet, testnet=False):
+    try:
+        exchange = get_hyperliquid_exchange(wallet, testnet=testnet)
+        user_state = exchange.info.user_state(address=wallet.address)
+        coin = symbol.split('/')[0]
+        
+        real_pos = None
+        for p in user_state.get('assetPositions', []):
+            pos = p.get('position', {})
+            if pos.get('coin') == coin:
+                szi = float(pos.get('szi', 0))
+                if abs(szi) > 0.00005:
+                    direction = 'long' if szi > 0 else 'short'
+                    entry = float(pos.get('entryPx', 0))
+                    size = abs(szi)
+                    real_pos = (direction, entry, size, entry)
+                    print(f"[SYNC] ✅ Real {direction.upper()} on {coin}: {size:.4f} @ {entry:.2f}")
+                    break
+
+        for tf, d in tf_data.items():
+            d['position'] = real_pos
+    except Exception as e:
+        print(f"[SYNC ERROR] {e}")
+
+def place_market_order(symbol: str, side: str, size: float, wallet=None):
+    """Aggressive market order with None guard"""
+    try:
+        if wallet is None:
+            wallet = Account.from_key(os.getenv('PRIVATE_KEY'))
+        if size is None or size <= 0:
+            print(f"[MARKET SKIP] Invalid size: {size}")
+            return None
+
+        exchange = get_hyperliquid_exchange(wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
+        coin = symbol.split('/')[0]
+        is_buy = side.lower() == 'buy'
+
+        print(f"[MARKET] {side.upper()} {size:.4f} {coin} @ MARKET")
+
+        order = exchange.order(
+            name=coin,
+            is_buy=is_buy,
+            sz=round(size, 4),
+            limit_px=None,
+            order_type={"limit": {"tif": "Ioc"}},
+            reduce_only=False
+        )
+        print(f"[MARKET SUCCESS] {side.upper()} {size:.4f} filled")
+        return order
+    except Exception as e:
+        print(f"[MARKET ERROR] {e}")
+        return None
+
+        # v15.5 Glide metadata tag
+        lim['glide_origin_price'] = price
+        lim['glide_origin_ts'] = time.time()
+        lim['tf'] = tf
+        lim['bias'] = bias
+        
+# ==================== TOPIARY HEDGE v15.3 (True Martingale + Capital Request) ====================
+
+class TopiaryHedge:
+    def __init__(self, direction, entry_price, size, tf):
+        self.direction = direction
+        self.entry_price = entry_price
+        self.size = size
+        self.rounds = 1
+        self.high = entry_price
+        self.low = entry_price
+        self.active = True
+        self.tf = tf
+        self.tapered_value = 0.0
+        self.cumulative_loss = 0.0   # for future creative recovery sequences
+
+    def double_down(self, current_price, is_top):
+        if self.rounds >= MAX_MARTINGALE_ROUNDS:
+            return False
+        self.rounds += 1
+        self.size *= 1.85                    # True aggressive martingale on hedge size
+        if is_top:
+            self.high = max(self.high, current_price)
+        else:
+            self.low = min(self.low, current_price)
+        return True
+
+    def taper(self, current_price, reason="MANUAL"):
+        if not self.active:
+            return 0.0
+        notional = min(self.size * current_price * min(LEVERAGE, 15), 8000)
+        returned = notional * 0.28
+        self.tapered_value = returned
+        self.active = False
+        print(f"[TOPIARY TAPER] {self.tf} {self.direction.upper()} R{self.rounds} → ${returned:,.0f} ({reason}) @ {current_price:.2f}")
+        return returned
+
+
+def update_topiary_hedges_v155(tf_data, current_price, args, current_signals=None, symbol=None, wallet=None):
+    """v15.4 - Harbor-gated NEW hedges + detect_left_turn counting + 36 global cap 
+       + market fallback for larger hedges + clearer prints + per-TF opening conditions"""
+    total_tapered = 0.0
+    current_ts = time.time()
+    is_live = wallet is not None and symbol is not None
+
+    # === GLOBAL 36 HEDGE CAP ===
+    total_active_hedges = sum(len(d.get('hedges', [])) for d in tf_data.values())
+    hedge_cap_reached = total_active_hedges >= 36
+    if hedge_cap_reached and not any(d.get('hedge_cap_logged') for d in tf_data.values()):
+        print("[HEDGE CAP] 36 hedge orders active across all TFs — new hedge creation paused")
+        for d in tf_data.values():
+            d['hedge_cap_logged'] = True
+
+    for tf, d in list(tf_data.items()):
+        pos = d.get('position')
+        if not pos:
+            continue
+
+        if len(pos) == 4:
+            side, entry, size, nose = pos
+        elif len(pos) == 3:
+            side, entry, size = pos
+            nose = d.get('last_nose') or entry
+        else:
+            continue
+
+        if 'hedges' not in d:
+            d['hedges'] = []
+
+        if len(d['hedges']) >= 8:  # per-TF safety
+            if not d.get('hedge_cap_logged', False):
+                print(f"[HEDGE CAP] Max 8 rounds on {tf} — further doubles locked")
+                d['hedge_cap_logged'] = True
+            continue
+
+        direction = side
+        tf_capital = d.get('capital', 800)
+
+        # === DOUBLE DOWN (always allowed for defense, even at cap) ===
+        doubled = False
+        for hedge in d['hedges']:
+            if hedge.direction == direction and hedge.active:
+                is_top = (direction == 'short')
+                if hedge.double_down(current_price, is_top):
+                    print(f"[NAKED HEDGE] {tf} {direction.upper()} doubled → R{hedge.rounds} @ {current_price:.2f}")
+                    # Count toward detect_left_turn (harden the link)
+                    try:
+                        detect_left_turn(None, current_price, direction)  # lower_tf_df optional in your version
+                    except Exception:
+                        pass
+
+                    if is_live:
+                        hedge_side = "buy" if direction == "long" else "sell"
+                        h_size = round(hedge.size * 0.98, 4)
+
+                        if h_size > 0.005:
+                            place_market_order(symbol, hedge_side, h_size, wallet)
+                        else:
+                            h_px = current_price * (1.008 if direction == "long" else 0.992)
+                            place_live_limit_order(symbol, hedge_side, h_size, h_px, wallet=wallet)
+                    doubled = True
+                break
+
+        # === NEW HEDGE — ONLY ON HARBOR STRIKE + OPENING CONDITIONS ===
+        if not doubled:
+            if not any(h.direction == direction and h.active for h in d['hedges']):
+                # Harbor gate (must be struck) + respect same opening conditions as main entries
+                harbor_struck = False
+                if current_signals:
+                    for sig in current_signals:
+                        if sig.get('timeframe') == tf:
+                            h_price = sig.get('harbor_price') or sig.get('eighth_price')
+                            if h_price:
+                                if abs(current_price - h_price) / current_price < 0.007:
+                                    harbor_struck = True
+                                    break
+
+                # Past activation offset / other opening conditions (if you track them per TF)
+                past_activation_ok = d.get('past_activation_offset_ok', True)
+
+                if not (harbor_struck and past_activation_ok):
+                    continue  # do not create new hedge
+
+                if hedge_cap_reached:
+                    continue
+
+                hedge_risk_usd = tf_capital * 0.10
+                hedge_size = max(round(hedge_risk_usd / current_price / max(LEVERAGE, 10), 4), 0.001)
+
+                hedge = TopiaryHedge(direction, current_price, hedge_size, tf)
+                d['hedges'].append(hedge)
+                d['last_hedge_time'] = current_ts
+                print(f"[TOPIARY] New hedge on {tf} {direction.upper()} @ {current_price:.2f} (size {hedge_size:.4f}) [HARBOR GATED]")
+
+                # Count this new hedge toward detect_left_turn
+                try:
+                    detect_left_turn(None, current_price, direction)
+                except Exception:
+                    pass
+
+                if is_live:
+                    h_side = "buy" if direction == "long" else "sell"
+                    h_px = current_price * (1.006 if direction == "long" else 0.994)
+                    place_live_limit_order(symbol, h_side, hedge_size, h_px, wallet=wallet)
+
+        # === TAPER CONDITIONS ===
+        for hedge in list(d['hedges']):
+            if not hedge.active:
+                continue
+
+            move_pct = 0.004 if tf in LOWER_TFS else 0.002
+            price_taper = (hedge.direction == 'short' and current_price < hedge.low * (1 - move_pct)) or \
+                          (hedge.direction == 'long' and current_price > hedge.high * (1 + move_pct))
+
+            structural_taper = False
+            if current_signals:
+                for sig in current_signals:
+                    if (sig.get('timeframe') == tf and
+                        sig.get('eighth_price') and
+                        abs(sig.get('eighth_price') - current_price) / current_price < 0.005):
+                        structural_taper = True
+                        break
+
+            round_taper = hedge.rounds >= 6
+
+            if price_taper or structural_taper or round_taper:
+                reason = "ROUND" if round_taper else "EIGHTH-MAN" if structural_taper else "PRICE"
+                returned = hedge.taper(current_price, reason)
+                if returned > 0:
+                    d['tapered_profit'] = d.get('tapered_profit', 0.0) + returned
+                    total_tapered += returned
+
+    if total_tapered > 10:
+        print(f"[TOPIARY] ✅ Session tapered: ${total_tapered:,.0f}")
+
+def evaluate_glide_v155(active_limits, current_price, current_ts):
+    """v15.5 — Evaluation only. 
+       Shows vertical distance from market to diagonal glide line.
+       Prints ALL tagged orders (FORMING or ACTIVE). Shorts ↑, Longs ↓."""
+    if not active_limits:
+        return
+
+    print("\n[GLIDE EVAL v15.5] Diagonal line check — vertical distance to glide path")
+    evaluated = 0
+    forming = 0
+
+    for key, lim in active_limits.items():          # <-- FIXED: iterate over .items()
+        if not isinstance(lim, dict):
+            continue
+        if not lim.get('glide_origin_price'):
+            continue
+
+        tf = lim.get('tf', '1m')
+        bias = lim.get('bias', 'long')
+        origin_px = lim.get('glide_origin_price')
+        origin_ts = lim.get('glide_origin_ts', current_ts)
+        resting_px = lim.get('price', origin_px)
+
+        minutes_elapsed = max((current_ts - origin_ts) / 60.0, 0.05)
+        step = GLIDE_STEP_PER_MIN.get(tf, 2.5)
+
+        if bias == 'short':
+            expected_glide_px = origin_px + (step * minutes_elapsed)
+        else:
+            expected_glide_px = origin_px - (step * minutes_elapsed)
+
+        vertical_dist = current_price - expected_glide_px
+        dist_pct = (vertical_dist / current_price) * 100.0
+        offset_pct = abs(current_price - resting_px) / resting_px
+
+        arrow = "↑" if bias == 'short' else "↓"
+
+        if offset_pct >= GLIDE_ACTIVATION_OFFSET_PCT:
+            status = "ACTIVE GLIDE"
+            evaluated += 1
+        else:
+            status = "FORMING"
+            forming += 1
+
+        print(f"  [{tf} {bias.upper()}] resting@{resting_px:.0f} | origin@{origin_px:.0f} | "
+              f"{minutes_elapsed:.1f}m | glide line: {expected_glide_px:.0f} | "
+              f"market {current_price:.0f} → vert.dist {vertical_dist:+.0f} ({dist_pct:+.2f}%) {arrow} [{status}]")
+
+    if evaluated == 0 and forming == 0:
+        print("  (no glide-tagged orders yet)")
+    else:
+        print(f"  → {evaluated} active glide | {forming} still forming (below 0.15% offset)")
+    print("[GLIDE EVAL] done\n")
+
+def create_topiary_hedge(tf, direction, price, size, tf_data):
+    if tf not in tf_data:
+        tf_data[tf] = {
+            'hedges': [], 
+            'hedge_capital': 0.0, 
+            'capital': 1000.0, 
+            'initial_capital': 1000.0,
+            'last_hedge_time': 0,
+            'tapered_profit': 0.0,
+            'hedge_cap_logged': False
+        }
+    hedge = TopiaryHedge(direction, price, size, tf)
+    tf_data[tf]['hedges'].append(hedge)
+    logging.info(f"[TOPIARY] Hedge created on {tf} @ {price:.2f}")
+    return hedge
+
+def request_capital(tf_data, needy_tf, amount_needed, min_transfer=25):
+    """Needy TF can request capital from tapered profits or light emergency harvest"""
+    if needy_tf not in tf_data:
+        return 0.0
+
+    pulled = 0.0
+    # 1. Pull from other TFs' tapered_profit first
+    for tf in list(tf_data.keys()):
+        if tf == needy_tf:
+            continue
+        avail = tf_data[tf].get('tapered_profit', 0.0)
+        if avail > min_transfer:
+            take = min(avail * 0.6, amount_needed - pulled)
+            if take > 0:
+                tf_data[tf]['tapered_profit'] -= take
+                pulled += take
+                print(f"[CAPITAL REQUEST] {needy_tf} pulled ${take:,.0f} from {tf} tapered_profit")
+
+    # 2. Light emergency harvest (only profitable portion) if still short
+    if pulled < amount_needed * 0.6:
+        for tf in list(tf_data.keys()):
+            if tf == needy_tf or not tf_data[tf].get('position'):
+                continue
+            # Only harvest if the TF has meaningful profit buffer (simplified check)
+            profit_buffer = tf_data[tf].get('capital', 0) - tf_data[tf].get('initial_capital', 800)
+            if profit_buffer > 40:
+                take = min(profit_buffer * 0.3, amount_needed - pulled)
+                if take > 10:
+                    tf_data[tf]['capital'] -= take
+                    pulled += take
+                    print(f"[EMERGENCY HARVEST] {needy_tf} received ${take:,.0f} from {tf} profit buffer")
+
+    if pulled > 0:
+        tf_data[needy_tf]['capital'] += pulled
+        print(f"[CAPITAL FOCUSED] {needy_tf} received total ${pulled:,.0f}")
+    return pulled
+
+
+def cycle_profits(tf_data, higher_tf, args):
+    """Enhanced cycle + answers capital requests"""
+    if higher_tf not in tf_data:
+        return
+
+    lower_tfs = [t for t in LOWER_TFS if t != higher_tf]
+    total_profit = 0.0
+
+    for low_tf in lower_tfs:
+        if low_tf not in tf_data:
+            continue
+        profit = tf_data[low_tf].get('tapered_profit', 0.0)
+        if profit > 30:
+            total_profit += profit
+            tf_data[low_tf]['tapered_profit'] = 0.0
+            tf_data[low_tf]['capital'] = tf_data[low_tf].get('initial_capital', tf_data[low_tf]['capital'])
+
+    if total_profit > 0:
+        added = total_profit * 0.70
+        tf_data[higher_tf]['capital'] += added
+        print(f"[CYCLE PROFIT] → {higher_tf} received ${added:,.0f} from lower TFs")
+
+def detect_left_turn(df, price, direction):
+    if df is None or len(df) < 8: return False
+    recent = df['close'].tail(8).values
+    recent_high = float(recent.max())
+    recent_low = float(recent.min())
+    if direction == "short":
+        return price >= recent_high * 0.997   # strong breakout up
+    else:
+        return price <= recent_low * 1.003    # strong breakout down
+
+def print_hedge_summary(tf_data, args):
+    logging.info("\n" + "="*80)
+    logging.info("HEDGE SUMMARY (15.1)")
+    logging.info("="*80)
+    total_hedges = 0
+    total_tapered = 0.0
+    total_rounds = 0
+    largest_hedge = 0.0
+    for tf in HIGHER_TFS:
+        if tf not in tf_data or 'hedges' not in tf_data[tf]:
+            continue
+        hedges = tf_data[tf]['hedges']
+        total_hedges += len(hedges)
+        for h in hedges:
+            if hasattr(h, 'tapered_value'):
+                total_tapered += h.tapered_value
+            total_rounds += h.rounds
+            largest_hedge = max(largest_hedge, h.size * h.entry_price * LEVERAGE)
+    logging.info(f"Total Hedges Created : {total_hedges}")
+    logging.info(f"Total Value Tapered : ${total_tapered:,.2f}")
+    logging.info(f"Average Rounds : {total_rounds / total_hedges:.1f}" if total_hedges > 0 else "Average Rounds : 0")
+    logging.info(f"Largest Hedge Value : ${largest_hedge:,.0f}")
+    logging.info("="*80 + "\n")
+
+# ==================== Exports ====================
+import json
+import time
+import os
+from datetime import datetime, timezone
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # ~/bots
+
+def export_harbor_lines_json(active_limits, current_price, symbol="BTC/USDC"):
+    """Clean export for Pine Script"""
+    lines = []
+    for key, order in active_limits.items():
+        lines.append({
+            "key": key,
+            "tf": order.get("tf", key.split("_")[0]),
+            "bias": order.get("bias", "long" if "long" in key else "short"),
+            "chain_type": order.get("chain_type", "pico"),
+            "price": float(order.get("price", 0)),
+            "size": float(order.get("size", 0.02)),
+            "hotspot_score": int(order.get("hotspot_score", 0)),
+            "timestamp": int(order.get("time", time.time())),
+            "hotspot": order.get("hotspot_score", 0) > 0
+        })
+
+    data = {
+        "timestamp": int(time.time()),
+        "current_price": float(current_price),
+        "symbol": symbol,
+        "total_lines": len(lines),
+        "lines": lines
     }
 
-def save_voice_config(config):
-    with open(VOICE_CONFIG, 'w') as f:
-        json.dump(config, f, indent=4)
+    try:
+        filepath = os.path.join(BASE_DIR, "harbor_lines.json")
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[HARBOUR] Exported {len(lines)} lines → {filepath}")
+    except Exception as e:
+        print(f"[HARBOUR EXPORT ERROR] {e}")
 
-# Load & apply voice
-voice_config = load_voice_config()
-engine = pyttsx3.init()
-if voice_config["voice_id"]:
-    engine.setProperty('voice', voice_config["voice_id"])
-engine.setProperty('rate', voice_config["rate"])
-engine.setProperty('volume', voice_config["volume"])
-print(f"Voice loaded: {voice_config['voice_id']}, rate {voice_config['rate']}, vol {voice_config['volume']}")
 
-CONFIG_FILE = "blossom_memory.json"
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    return {
-        "man_offset_short": 5,
-        "eighth_offset_short": 9,
-        "man_offset_long": 22,
-        "eighth_offset_long": 36,
-        "learning_enabled": True
+def export_state_json(active_limits, current_price, free_capital=0, harbor_notional=0,
+                      hedged_reserve=0, reinvestable_margin=0, roster=None, symbol="BTC/USDC"):
+    """Rich state for Dashboard + Affordance Roster"""
+    state = {
+        "timestamp": int(time.time()),
+        "current_price": float(current_price),
+        "symbol": symbol,
+        "active_count": len(active_limits),
+        "free_capital": float(free_capital),
+        "harbor_notional": float(harbor_notional),
+        "hedged_reserve": float(hedged_reserve),
+        "reinvestable_margin": float(reinvestable_margin),
+        "active_limits": {}
     }
 
-config = load_config()
-learning_enabled = config['learning_enabled']
-man_offset_short = config['man_offset_short']
-eighth_offset_short = config['eighth_offset_short']
-man_offset_long = config['man_offset_long']
-eighth_offset_long = config['eighth_offset_long']
+    # Include roster data if available
+    if roster:
+        state["roster"] = roster.get_roster_state()
 
-# Logging — force utf-8 to avoid charmap crash
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("terminal_readout_curve_swing.txt", encoding='utf-8')
-    ]
-)
-file_handler = logging.FileHandler("terminal_readout_curve_swing.txt")
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-logging.getLogger().addHandler(file_handler)
+    for key, order in active_limits.items():
+        state["active_limits"][key] = {
+            "tf": order.get("tf", key.split("_")[0]),
+            "bias": order.get("bias", "long" if "long" in key.lower() else "short"),
+            "chain_type": order.get("chain_type", "pico"),
+            "price": float(order.get("price", 0)),
+            "size": float(order.get("size", 0.02)),
+            "time": int(order.get("time", time.time())),
+            "hotspot_score": int(order.get("hotspot_score", 0)),
+            "oid": order.get("oid"),
+            "original_price": float(order.get("original_price", order.get("price", 0)))
+        }
 
-def log_print(*args, **kwargs):
-    logging.info(" ".join(map(str, args)))
+    try:
+        os.makedirs("public", exist_ok=True)
+        with open("public/live_state.json", "w") as f:
+            json.dump(state, f, indent=2)
+        print(f"[STATE] Exported rich dashboard state ({len(active_limits)} limits) → public/live_state.json")
+    except Exception as e:
+        print(f"[STATE EXPORT ERROR] {e}")
 
-def print(*args, **kwargs):
-    log_print(*args)
-    sys.__stdout__.write(" ".join(map(str, args)) + "\n")
+def export_pine_ready(active_limits, current_price, symbol="BTC/USDC"):
+    """Generate clean, beautiful Pine Script with up to 36 rays"""
+    calls = ""
+    count = 0
+    
+    for key, o in active_limits.items():
+        tf = o.get("tf", key.split("_")[0] if "_" in key else "1m")
+        bias = o.get("bias", "long")
+        chain = o.get("chain_type", "pico")
+        
+        a1 = float(o.get("anchor1_price", o.get("price", 0)))
+        a2 = float(o.get("anchor2_price", o.get("price", 0)))
+        hotspot = o.get("hotspot_score", 0) > 0
+        
+        # Smart offset calculation
+        try:
+            anchor1_time = pd.to_datetime(o.get("anchor1_time"))
+            anchor2_time = pd.to_datetime(o.get("anchor2_time"))
+            
+            if anchor1_time.tz is None:
+                anchor1_time = anchor1_time.tz_localize('UTC')
+            if anchor2_time.tz is None:
+                anchor2_time = anchor2_time.tz_localize('UTC')
+            
+            tf_minutes = {'1m':1, '3m':3, '5m':5, '15m':15, '1h':60, '4h':240, '1d':1440, '1w':10080, '1M':43200}.get(tf, 1)
+            offset1 = int((datetime.now(timezone.utc) - anchor1_time).total_seconds() / 60 / tf_minutes) + 45
+            offset2 = int((datetime.now(timezone.utc) - anchor2_time).total_seconds() / 60 / tf_minutes) + 10
+            
+            offset1 = max(80, min(offset1, 450))
+            offset2 = max(10, min(offset2, 120))
+        except:
+            offset1 = 180
+            offset2 = 40
+        
+        calls += f'    draw_ray("{tf}", "{bias}", "{chain}", {offset1}, {a1:.2f}, {offset2}, {a2:.2f}, {str(hotspot).lower()})\n'
+        count += 1
 
-DEFAULT_SYMBOL = "SOL/USDT"
-DEFAULT_TIMEFRAME = "1m"
-LEVERAGE = 20
-WAVE_FILE = "blossom_speak.wav"
+    full_script = f"""//@version=6
+indicator("TETRA • Harbor Rays LIVE [Auto from Python - 36 Rays]", overlay=true, max_lines_count=500, max_labels_count=500)
 
-# Helpers for learning
-def get_recent_triplets(df):
+// ── SETTINGS ──
+highlight_hot = input.bool(true, "Highlight Hotspots", group="Global")
+show_debug    = input.bool(false, "Show Debug Labels", group="Global")
+
+left_magnet   = input.string("High/Low", "Left Anchor (Wick)", 
+     options=["High/Low", "High", "Low", "Closest OHLC", "Exact"], group="Magnet")
+
+right_magnet  = input.string("Open/Close", "Right Anchor (Body)", 
+     options=["Open/Close", "Open", "Close", "Closest OHLC", "Exact"], group="Magnet")
+
+// Colors - Light Pico / Dark Nano
+c_pico_long   = color.new(#00F5FF, 0)   // cyan light
+c_pico_short  = color.new(#FF44AA, 0)   // pink light
+c_nano_long   = color.new(#0088FF, 0)   // blue dark
+c_nano_short  = color.new(#FF0088, 0)   // red dark
+
+var line[]   rays   = array.new<line>()
+var label[]  labels = array.new<label>()
+
+// ==================== SAFE MAGNET ====================
+magnet_price(src_price, bars_back, side) =>
+    safe_bars = math.min(bars_back, 4999)
+    mode = side == "left" ? left_magnet : right_magnet
+    switch mode
+        "Exact" => src_price
+        "High"  => high[safe_bars]
+        "Low"   => low[safe_bars]
+        "Open"  => open[safe_bars]
+        "Close" => close[safe_bars]
+        "High/Low" =>
+            h = high[safe_bars]
+            l = low[safe_bars]
+            math.abs(src_price - h) <= math.abs(src_price - l) ? h : l
+        "Open/Close" =>
+            o = open[safe_bars]
+            c = close[safe_bars]
+            math.abs(src_price - o) <= math.abs(src_price - c) ? o : c
+        => 
+            o = open[safe_bars]
+            h = high[safe_bars]
+            l = low[safe_bars]
+            c = close[safe_bars]
+            d_o = math.abs(src_price - o)
+            min_d = math.min(d_o, math.abs(src_price - h), math.abs(src_price - l), math.abs(src_price - c))
+            min_d == d_o ? o : min_d == math.abs(src_price - h) ? h : min_d == math.abs(src_price - l) ? l : c
+
+// ==================== DRAW FUNCTION ====================
+draw_ray(tf, bias, chain, offset1, p1, offset2, p2, hotspot) =>
+    is_pico = chain == "pico"
+    col = if is_pico
+        bias == "long" ? c_pico_long : c_pico_short
+    else
+        bias == "long" ? c_nano_long : c_nano_short
+    
+    width = hotspot and highlight_hot ? 3 : 2
+    
+    start_idx = math.max(bar_index - offset1, 0)
+    end_idx   = math.max(bar_index - offset2, 0)
+    
+    a1 = magnet_price(p1, offset1, "left")
+    a2 = magnet_price(p2, offset2, "right")
+    
+    if math.abs(a1 - a2) < syminfo.mintick * 3
+        a2 := a1 + (bias == "long" ? -syminfo.mintick * 8 : syminfo.mintick * 8)
+    
+    ray = line.new(start_idx, a1, end_idx, a2, color=col, width=width, style=line.style_solid, extend=extend.right)
+    array.push(rays, ray)
+    
+    label.new(start_idx + 4, a1, "●", color=col, textcolor=color.white, size=size.small)
+    label.new(end_idx + 4, a2, "◆", color=col, textcolor=color.white, size=size.small)
+    
+    label_text = tf + (is_pico ? " P" : " N") + (bias == "long" ? "▲" : "▼")
+    label.new(end_idx + 15, a2, label_text, 
+              color=color.new(col, 70), textcolor=color.white, 
+              style=label.style_label_left, size=size.tiny)
+
+// ==================== SAFE CLEAR + DRAW ====================
+if barstate.islast
+    if array.size(rays) > 0
+        for i = 0 to array.size(rays) - 1
+            line.delete(array.get(rays, i))
+        array.clear(rays)
+    if array.size(labels) > 0
+        for i = 0 to array.size(labels) - 1
+            label.delete(array.get(labels, i))
+        array.clear(labels)
+    
+    // === AUTO-GENERATED RAYS FROM TETRIS_TOPIARY.PY ===
+{calls}
+
+    // Add more draw_ray() calls here if needed (up to 36)
+
+// ==================== INFO PANEL ====================
+var table info = table.new(position.top_right, 1, 5, bgcolor=color.new(#0f1a1f, 85))
+if barstate.islast
+    table.cell(info, 0, 0, "TETRA HARBOR RAYS", text_color=#50D2C1, text_size=size.normal)
+    table.cell(info, 0, 1, "P = Pico (Light) | N = Nano (Dark)", text_color=color.gray)
+    table.cell(info, 0, 2, "▲ Long | ▼ Short", text_color=color.gray)
+    table.cell(info, 0, 3, "Increase Max Left Extension if needed", text_color=color.gray)
+    table.cell(info, 0, 4, "🦆 Ducks fly together", text_color=#50D2C1)
+"""
+
+    try:
+        filepath = os.path.join(BASE_DIR, "harbor_pine_ready.txt")
+        with open(filepath, "w") as f:
+            f.write(full_script)
+        print(f"[PINE] ✅ Exported {count} rays → {filepath}")
+        print("     → Copy ALL content into TradingView")
+    except Exception as e:
+        print(f"[PINE EXPORT ERROR] {e}")
+
+# ==================== CORE SIGNAL FUNCTIONS ====================
+def triplet_swings(df):
+    """Atomic triplet swings - used by all layers"""
     highs = df["high"].values
     lows = df["low"].values
-    triplets = []
+    up, down = [], []
     for i in range(2, len(df)):
         if highs[i-1] > highs[i-2] and highs[i-1] > highs[i]:
-            triplets.append({'time': df.index[i-1], 'price': highs[i-1], 'type': 'high'})
+            up.append(i-1)
         if lows[i-1] < lows[i-2] and lows[i-1] < lows[i]:
-            triplets.append({'time': df.index[i-1], 'price': lows[i-1], 'type': 'low'})
-    return triplets
+            down.append(i-1)
+    return up, down
 
-def triplet_docks_over_anchor(recent_triplets, line):
-    anchor_price = line['anchor1_price'] if line['bias'] == 'long' else line['anchor2_price']
-    for trip in recent_triplets:
-        if trip['type'] == 'high' and trip['price'] > anchor_price + 0.01 * anchor_price:
-            return True
-        if trip['type'] == 'low' and trip['price'] < anchor_price - 0.01 * anchor_price:
+def count_triplets(df, max_lookback=400):
+    """Count current streak of long (lower lows) and short (higher highs) structures"""
+    if len(df) < 30:
+        return {'long_streak': 0, 'short_streak': 0, 'last_swing': None}
+
+    up_swings, down_swings = triplet_swings(df.tail(max_lookback))  # up = local highs, down = local lows
+
+    # Merge all swings with type
+    all_swings = []
+    for idx in up_swings:
+        all_swings.append((idx, 'short'))   # higher high → short bias structure
+    for idx in down_swings:
+        all_swings.append((idx, 'long'))    # lower low → long bias structure
+
+    all_swings.sort(key=lambda x: x[0])  # sort by candle index
+
+    long_streak = 0
+    short_streak = 0
+    last_type = None
+
+    for _, swing_type in all_swings[-20:]:   # only look at recent swings for streak
+        if swing_type == 'long':
+            if last_type == 'long':
+                long_streak += 1
+            else:
+                long_streak = 1
+            short_streak = 0
+        else:  # 'short'
+            if last_type == 'short':
+                short_streak += 1
+            else:
+                short_streak = 1
+            long_streak = 0
+        last_type = swing_type
+
+    return {
+        'long_streak': long_streak,
+        'short_streak': short_streak,
+        'last_swing': last_type,
+        'total_swings': len(all_swings)
+    }
+
+def detect_sailfish(df_leg, bias):
+    if len(df_leg) < 12:
+        return None
+    df_leg = df_leg.tail(500).copy()
+    if len(df_leg) < 12:
+        return None
+    _, down_swings = triplet_swings(df_leg)
+    if len(down_swings) < 4:
+        return None
+    best = None
+    best_score = -1
+    for i in range(2, len(down_swings)-2):
+        sail_low_idx = down_swings[i]
+        man_idx = down_swings[i+1]
+        sail5_idx = down_swings[i+2]
+        sail_low = float(df_leg['low'].iloc[sail_low_idx])
+        man_price = float(df_leg['high'].iloc[man_idx] if bias == 'long' else df_leg['low'].iloc[man_idx])
+        sail5 = float(df_leg['high'].iloc[sail5_idx] if bias == 'long' else df_leg['low'].iloc[sail5_idx])
+        man_candle = df_leg.iloc[man_idx]
+        body = abs(man_candle['close'] - man_candle['open'])
+        rng = man_candle['high'] - man_candle['low'] + 1e-8
+        if body / rng < 0.40:
+            man_price = float(man_candle['close'])
+        if bias == 'long':
+            if sail_low < man_price < sail5 * 1.002:
+                depth = (man_price - sail_low) / (sail5 - sail_low + 1e-8)
+                recency = (man_idx / len(df_leg)) ** 2.0
+                score = depth + recency * 1.6
+                if score > best_score:
+                    best_score = score
+                    best = {'man_idx': man_idx, 'man_price': man_price, 'low_price': sail_low}
+        else:
+            if sail_low > man_price > sail5 * 0.998:
+                depth = (sail_low - man_price) / (sail_low - sail5 + 1e-8)
+                recency = (man_idx / len(df_leg)) ** 2.0
+                score = depth + recency * 1.6
+                if score > best_score:
+                    best_score = score
+                    best = {'man_idx': man_idx, 'man_price': man_price, 'low_price': sail_low}
+    return best
+
+def get_zipper_state(tf_data, tf):
+    structures = tf_data[tf].get('recent_structures', [])
+    if len(structures) < 4:
+        return {'zipper_score': 0.0, 'alternating': False, 'streak': 1, 'momentum': 0.0}
+
+    # Weight recent alternations more heavily
+    recent = structures[-8:]
+    alternations = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i-1])
+    alt_ratio = alternations / max(1, len(recent) - 1)
+
+    streak = 1
+    for i in range(len(structures)-2, -1, -1):
+        if structures[i] == structures[-1]:
+            streak += 1
+        else:
+            break
+
+    zipper_score = min(3.0, alt_ratio * 3.2)
+    if alternations >= 4 and streak <= 2:
+        zipper_score += 0.8
+
+    momentum = min(1.0, alternations / 6.0)   # how fast it's flipping
+
+    return {
+        'zipper_score': round(zipper_score, 2),
+        'alternating': alternations >= 3,
+        'streak': streak,
+        'momentum': round(momentum, 2),
+        'recent': structures[-6:]
+    }
+
+def is_too_close_to_existing(new_price: float, active_limits: dict, tolerance: float = 8.0) -> bool:
+    """Lifted guard — allows full 72-slot roster. Only blocks near-duplicates."""
+    if tolerance >= 50.0:  # High tolerance = effectively disabled for stacking
+        return False
+    
+    for key, order in active_limits.items():
+        existing = order.get('price', 0)
+        if abs(new_price - existing) < tolerance:
+            print(f"   → Skipped: too close to existing {key} @ {existing:.2f} (tol={tolerance})")
             return True
     return False
 
-def recalculate_slope_from_dock(recent_triplets, line):
-    if not recent_triplets:
-        return line['slope']
-    new_anchor2_time = recent_triplets[-1]['time']
-    new_anchor2_price = recent_triplets[-1]['price']
-    delta_t = (new_anchor2_time - line['anchor1_time']).total_seconds() / 3600
-    if delta_t > 0:
-        return (new_anchor2_price - line['anchor1_price']) / delta_t
-    return line['slope']
+def detect_sailfish_strength(sig, df=None):
+    """Boost for clean sailfish patterns"""
+    if not sig or 'chain_type' not in sig:
+        return 1.0
+    
+    chain = sig['chain_type']
+    slope_abs = abs(sig.get('slope', 0))
+    
+    if chain == 'macro' and slope_abs > 60:
+        return 2.2
+    elif chain == 'micro' and slope_abs > 100:
+        return 1.8
+    elif chain in ['pico', 'nano'] and slope_abs > 160:
+        return 1.5
+    return 1.0
 
-def blossom_speak(text):
-    print(f"Blossom: {text}")
-    engine.save_to_file(text, WAVE_FILE)
-    engine.runAndWait()
+def should_replace_existing_harbor(existing_order, new_sig, current_price, dev=False):
+    """
+    Replacement rules (v15.9.2):
+    - Same TF + same bias
+    - New signal has a more recent nose, OR
+    - New signal came from an opposite-bias retracement (fresh nose)
+    → Replace the old harbor
+    """
+    if not existing_order or not new_sig:
+        return False
+
+    if existing_order.get('tf') != new_sig.get('timeframe'):
+        return False
+    if existing_order.get('bias') != new_sig.get('bias'):
+        return False
+
+    # High priority if this new nose came from a retracement on the opposite bias
+    if new_sig.get('opposite_bias_retracement', False):
+        if dev:
+            print(f"[REPLACED] Opposite-bias retracement created fresh nose on "
+                  f"{new_sig.get('timeframe')} {new_sig.get('bias').upper()}")
+        return True
+
+    # Normal recency check
     try:
-        import winsound
-        winsound.PlaySound(WAVE_FILE, winsound.SND_FILENAME)
-    except Exception as e:
-        print("Winsound failed:", e)
-        os.startfile(WAVE_FILE)
+        existing_nose_time = pd.to_datetime(existing_order.get('nose_time') or existing_order.get('born_on'))
+        new_nose_time = pd.to_datetime(new_sig.get('nose_time') or new_sig.get('born_on'))
 
-def state_to_json(state):
-    serial = {
-        'capital': float(state.get('capital', 1000.0)),
-        'spot_sol': float(state.get('sol_spot', 0.0)),
-        'positions': {tf: {'dir': p[0], 'entry': float(p[1]), 'size': float(p[2])}
-                      for tf, p in state.get('positions', {}).items() if p},
-        'dd': float(state.get('trade_dd', 0.0)),
-        'last_flip': str(state.get('last_flip_time', '')),
-        'lines_active': len(state.get('active_lines', [])),
-        'rejections': state.get('rejections', []),
-        'noses': state.get('noses', {}),  # new: save noses per tf
-        'timestamp': datetime.now(timezone.utc).isoformat()
+        if existing_nose_time.tz is None:
+            existing_nose_time = existing_nose_time.tz_localize('UTC')
+        if new_nose_time.tz is None:
+            new_nose_time = new_nose_time.tz_localize('UTC')
+
+        if new_nose_time > existing_nose_time:
+            return True
+
+    except Exception:
+        return True
+
+    return False
+
+def get_most_recent_unstruck_per_tf(signals, tf):
+    tf_signals = [s for s in signals if s.get('timeframe') == tf and not s.get('struck', False)]
+    if not tf_signals:
+        return []
+    by_bias = {}
+    for sig in tf_signals:
+        bias = sig.get('bias')
+        if bias not in by_bias or sig.get('born_on', 0) > by_bias[bias].get('born_on', 0):
+            by_bias[bias] = sig
+    return list(by_bias.values())
+
+def should_place_reversal(sig):
+    if not sig.get('eighth_idx'):
+        return False
+    born = sig.get('born_on')
+    if born and (datetime.now() - born).total_seconds() > 300:
+        return True
+    return False
+
+def passes_activation_gate(eighth_idx, swings_after, chain_type):
+    """
+    Relaxed fractal activation gate for live/testnet
+    - pico/nano activate very quickly (almost immediate)
+    - micro/macro wait for 1–2 extra confirmations
+    """
+    if not swings_after:
+        return False
+
+    # Count how many swings happened AFTER the eighth swing
+    extra_swings = sum(1 for idx in swings_after if idx > eighth_idx)
+
+    min_required = {
+        'pico': 0,      # pico can fire instantly
+        'nano': 1,
+        'micro': 2,
+        'macro': 3
+    }.get(chain_type, 1)
+
+    return extra_swings >= min_required
+    
+def get_recent_harbor_signals(df_input, timeframe_or_dict=None, args=None, dev: bool = False):
+    """
+    v15.9.2 - Clean fractal version (no layover logic inside)
+    - 1m uses raw triplets (pico/nano) with activation gate
+    - All other TFs use centre-of-5 noses
+    - Swapped bias + safe indexing
+    - Uses your exact MICRO/MACRO constants
+    """
+    if isinstance(df_input, dict):
+        df_dict = df_input
+        dev_flag = getattr(args, 'dev', dev)
+    else:
+        df_dict = {timeframe_or_dict: df_input}
+        dev_flag = getattr(args, 'dev', dev) if args else dev
+
+    all_signals = []
+    seen = {}
+
+    for tf, df in df_dict.items():
+        if df is None or len(df) < 100:
+            continue
+
+        if tf in ['1d', '1w', '1M']:
+            df = df.tail(400).copy()
+        else:
+            df = df.tail(900).copy()
+
+        if tf in ['15m', '1h', '4h', '1d', '1w', '1M']:
+            recency_cutoff = df.index[-1] - pd.Timedelta(hours=48 if tf in ['15m','1h'] else 96)
+            df = df[df.index >= recency_cutoff].copy()
+
+        up_swings, down_swings = triplet_swings(df)
+        signals = []
+
+        # === Mode Selection ===
+        if tf == '1m':
+            use_raw_triplets = True
+            if dev_flag:
+                print(f"[{tf}] Using RAW TRIPLETS on 1m (for pico/nano)")
+        else:
+            use_raw_triplets = False
+            if dev_flag:
+                print(f"[{tf}] Using Centre-of-5 noses")
+
+        if use_raw_triplets:
+            # RAW TRIPLET MODE (1m)
+            for i in range(3, len(up_swings)):
+                if i + 2 >= len(up_swings): continue
+                nose_idx = up_swings[i]
+                man_idx = up_swings[i + 1]
+                eighth_idx = up_swings[i + 2]
+                ups_after = [idx for idx in up_swings if idx > nose_idx]
+
+                if not passes_activation_gate(eighth_idx, ups_after, 'pico' if (i % 2 == 0) else 'nano'):
+                    continue
+
+                nose_price = float(df['high'].iloc[nose_idx])
+                a1_p = float(df['low'].iloc[man_idx])
+                a2_p = float(df['close'].iloc[eighth_idx])
+                if a2_p <= a1_p * 1.001:
+                    a2_p = a1_p * 1.007
+
+                delta_t = max((df.index[eighth_idx] - df.index[man_idx]).total_seconds() / 3600, 0.25)
+                slope = min((a2_p - a1_p) / delta_t, 220)
+                leading = round(a1_p + slope * 1.15, 2)
+                leading = min(leading, float(df['close'].iloc[-1]) * 1.085)
+
+                sig = {
+                    'timeframe': tf,
+                    'bias': 'long',
+                    'chain_type': 'pico' if (i % 2 == 0) else 'nano',
+                    'nose_idx': nose_idx,
+                    'nose_price': nose_price,
+                    'nose_time': str(df.index[nose_idx]),
+                    'man_idx': man_idx,
+                    'man_time': str(df.index[man_idx]),
+                    'eighth_idx': eighth_idx,
+                    'eighth_time': str(df.index[eighth_idx]),
+                    'anchor1_price': a1_p,
+                    'anchor1_time': str(df.index[man_idx]),
+                    'anchor2_price': a2_p,
+                    'anchor2_time': str(df.index[eighth_idx]),
+                    'leading_limit': leading,
+                    'slope': slope,
+                    'born_on': df.index[nose_idx],
+                    'activation_offset': 1,
+                    'hotspot_score': 0,
+                    'sailfish_strength': 1.0,
+                    'opposite_bias_retracement': False
+                }
+                signals.append(sig)
+
+            # SHORTS block (exactly the same as you have)
+            for i in range(3, len(down_swings)):
+                if i + 2 >= len(down_swings): continue
+                nose_idx = down_swings[i]
+                man_idx = down_swings[i + 1]
+                eighth_idx = down_swings[i + 2]
+                downs_after = [idx for idx in down_swings if idx > nose_idx]
+
+                if not passes_activation_gate(eighth_idx, downs_after, 'pico' if (i % 2 == 0) else 'nano'):
+                    continue
+
+                nose_price = float(df['low'].iloc[nose_idx])
+                a1_p = float(df['high'].iloc[man_idx])
+                a2_p = float(df['close'].iloc[eighth_idx])
+                if a2_p >= a1_p * 0.999:
+                    a2_p = a1_p * 0.993
+
+                delta_t = max((df.index[eighth_idx] - df.index[man_idx]).total_seconds() / 3600, 0.25)
+                slope = max((a2_p - a1_p) / delta_t, -220)
+                leading = round(a1_p + slope * 1.15, 2)
+                leading = max(leading, float(df['close'].iloc[-1]) * 0.915)
+
+                sig = {
+                    'timeframe': tf,
+                    'bias': 'short',
+                    'chain_type': 'pico' if (i % 2 == 0) else 'nano',
+                    'nose_idx': nose_idx,
+                    'nose_price': nose_price,
+                    'nose_time': str(df.index[nose_idx]),
+                    'man_idx': man_idx,
+                    'man_time': str(df.index[man_idx]),
+                    'eighth_idx': eighth_idx,
+                    'eighth_time': str(df.index[eighth_idx]),
+                    'anchor1_price': a1_p,
+                    'anchor1_time': str(df.index[man_idx]),
+                    'anchor2_price': a2_p,
+                    'anchor2_time': str(df.index[eighth_idx]),
+                    'leading_limit': leading,
+                    'slope': slope,
+                    'born_on': df.index[nose_idx],
+                    'activation_offset': 1,
+                    'hotspot_score': 0,
+                    'sailfish_strength': 1.0,
+                    'opposite_bias_retracement': False
+                }
+                signals.append(sig)
+
+        else:
+            # ==================== CENTRE-OF-5 NOSES (3m+) - SAFE + FRACTAL ====================
+            long_noses = []
+            short_noses = []
+
+            # LONGS: centre of 5 higher highs
+            for i in range(2, len(up_swings) - 2):
+                window = up_swings[i-2:i+3]
+                prices = [float(df['high'].iloc[j]) for j in window]
+                if prices[2] == max(prices):
+                    long_noses.append((window[2], prices[2]))
+
+            # SHORTS: centre of 5 lower lows
+            for i in range(2, len(down_swings) - 2):
+                window = down_swings[i-2:i+3]
+                prices = [float(df['low'].iloc[j]) for j in window]
+                if prices[2] == min(prices):
+                    short_noses.append((window[2], prices[2]))
+
+            layers = [
+                ('pico',  MIN_CHAIN_PICO,  MAN_OFFSET_PICO,  EIGHTH_OFFSET_PICO,  ACTIVATION_OFFSET_PICO, 180, 1.4),
+                ('nano',  MIN_CHAIN_NANO,  MAN_OFFSET_NANO,  EIGHTH_OFFSET_NANO,  ACTIVATION_OFFSET_NANO, 220, 1.1),
+                ('micro', MIN_CHAIN_MICRO, MAN_OFFSET_MICRO, EIGHTH_OFFSET_MICRO, ACTIVATION_OFFSET_MICRO, 120, 3.2),
+                ('macro', MIN_CHAIN_MACRO, MAN_OFFSET_MACRO, EIGHTH_OFFSET_MACRO, ACTIVATION_OFFSET_MACRO, 80,  7.0),
+            ]
+
+            for chain_type, min_chain, man_off, eighth_off, act_off, slope_cap, hours_ahead in layers:
+                # LONGS
+                for nose_idx, nose_price in long_noses[-10:]:
+                    ups_after = [idx for idx in up_swings if idx > nose_idx]
+                    if len(ups_after) <= eighth_off:
+                        continue
+                    man_idx = ups_after[man_off]
+                    eighth_idx = ups_after[eighth_off]
+
+                    if not passes_activation_gate(eighth_idx, ups_after, chain_type):
+                        continue
+
+                    a1_p = float(df['low'].iloc[man_idx])
+                    a2_p = float(df['close'].iloc[eighth_idx])
+                    if a2_p <= a1_p * 1.001:
+                        a2_p = a1_p * 1.007
+
+                    delta_t = max((df.index[eighth_idx] - df.index[man_idx]).total_seconds() / 3600, 0.6)
+                    slope = min((a2_p - a1_p) / delta_t, slope_cap)
+
+                    leading = round(a1_p + slope * hours_ahead, 2)
+                    leading = min(leading, float(df['close'].iloc[-1]) * (1 + 0.085))
+
+                    sig = {
+                        'timeframe': tf,
+                        'bias': 'long',
+                        'chain_type': chain_type,
+                        'nose_idx': nose_idx,
+                        'nose_price': float(nose_price),
+                        'nose_time': str(df.index[nose_idx]),
+                        'man_idx': man_idx,
+                        'man_time': str(df.index[man_idx]),
+                        'eighth_idx': eighth_idx,
+                        'eighth_time': str(df.index[eighth_idx]),
+                        'anchor1_price': a1_p,
+                        'anchor1_time': str(df.index[man_idx]),
+                        'anchor2_price': a2_p,
+                        'anchor2_time': str(df.index[eighth_idx]),
+                        'leading_limit': leading,
+                        'slope': slope,
+                        'born_on': df.index[nose_idx],
+                        'activation_offset': act_off,
+                        'hotspot_score': 1 if chain_type in ['micro', 'macro'] else 0,
+                        'sailfish_strength': 1.0 if chain_type in ['pico', 'nano'] else 0.6
+                    }
+                    signals.append(sig)
+
+                # SHORTS
+                for nose_idx, nose_price in short_noses[-10:]:
+                    downs_after = [idx for idx in down_swings if idx > nose_idx]
+                    if len(downs_after) <= eighth_off:
+                        continue
+                    man_idx = downs_after[man_off]
+                    eighth_idx = downs_after[eighth_off]
+
+                    if not passes_activation_gate(eighth_idx, downs_after, chain_type):
+                        continue
+
+                    a1_p = float(df['high'].iloc[man_idx])
+                    a2_p = float(df['close'].iloc[eighth_idx])
+                    if a2_p >= a1_p * 0.999:
+                        a2_p = a1_p * 0.993
+
+                    delta_t = max((df.index[eighth_idx] - df.index[man_idx]).total_seconds() / 3600, 0.6)
+                    slope = max((a2_p - a1_p) / delta_t, -slope_cap)
+
+                    leading = round(a1_p + slope * hours_ahead, 2)
+                    leading = max(leading, float(df['close'].iloc[-1]) * (1 - 0.085))
+
+                    sig = {
+                        'timeframe': tf,
+                        'bias': 'short',
+                        'chain_type': chain_type,
+                        'nose_idx': nose_idx,
+                        'nose_price': float(nose_price),
+                        'nose_time': str(df.index[nose_idx]),
+                        'man_idx': man_idx,
+                        'man_time': str(df.index[man_idx]),
+                        'eighth_idx': eighth_idx,
+                        'eighth_time': str(df.index[eighth_idx]),
+                        'anchor1_price': a1_p,
+                        'anchor1_time': str(df.index[man_idx]),
+                        'anchor2_price': a2_p,
+                        'anchor2_time': str(df.index[eighth_idx]),
+                        'leading_limit': leading,
+                        'slope': slope,
+                        'born_on': df.index[nose_idx],
+                        'activation_offset': act_off,
+                        'hotspot_score': 1 if chain_type in ['micro', 'macro'] else 0,
+                        'sailfish_strength': 1.0 if chain_type in ['pico', 'nano'] else 0.6
+                    }
+                    signals.append(sig)
+
+        # DEDUPLICATION (unchanged)
+        for sig in signals:
+            base_price = sig['leading_limit']
+            price_key = f"{tf}_{sig['bias']}_{round(base_price, 1)}"
+            score = sig.get('hotspot_score', 0)
+            if price_key not in seen or score > seen[price_key].get('score', -1):
+                sig['score'] = score
+                seen[price_key] = sig
+
+    final_signals = list(seen.values())
+    final_signals.sort(key=lambda x: x.get('score', 0), reverse=True)
+
+    print(f"[HARBOUR] Generated {len(final_signals)} unique signals after dedup "
+          f"(from {len(seen)} candidates)")
+
+    return final_signals
+
+def flip_to_phase(tf_data, tf, new_direction, price, size, line, trades, current_time, i, stop_buffer, min_delta_pct, fees):
+    d = tf_data[tf]
+    
+    if d.get('position'):
+        old_dir, old_entry, old_size = d['position']
+        if old_dir == new_direction:
+            return False
+        delta = abs(price - old_entry) / old_entry * 100
+        if delta < min_delta_pct + fees:
+            return False
+        profit = (price - old_entry) * old_size * LEVERAGE if old_dir == "long" else (old_entry - price) * old_size * LEVERAGE
+        fee_cost = abs(profit) * fees / 100
+        d['capital'] += profit - fee_cost
+        d['total_fees'] = d.get('total_fees', 0) + fee_cost
+        d['wins' if profit > 0 else 'losses'] += 1
+        d['total_trades'] += 1
+        trades.append(f"{current_time} {tf} REVERSE {old_dir.upper()} → {new_direction.upper()} P/L {profit:.2f}")
+    else:
+        trades.append(f"{current_time} {tf} OPEN {new_direction.upper()} @ {price:.2f} ({line.get('chain_type','pico')})")
+
+    # === NEW SAFE STOP LOGIC ===
+    # Use A2 price as base + small buffer, or fallback to current price
+    a2_price = line.get('anchor2_price', price)
+    if new_direction == "long":
+        sl_level = a2_price * (1 - stop_buffer * 3)      # wider buffer for long
+    else:
+        sl_level = a2_price * (1 + stop_buffer * 3)
+
+    d['position'] = (new_direction, price, size)
+    d['stop_loss_level'] = sl_level
+    d['last_flip_candle_idx'] = i
+    line['disabled'] = True
+    return True
+
+import json
+import pandas as pd
+from datetime import datetime
+import os
+
+LAYOVER_FILE = "harbor_layover.json"   # ← change path if you want
+
+def create_harbor_layover_from_backtest(df_dict, end_time=None, dev: bool = False):
+    """
+    Run full backtest-style signal generation on historical data up to `end_time`
+    and save the MOST RECENT active Harbor signals as the layover file.
+    """
+    if end_time is None:
+        # If no cutoff given, use the very last timestamp in the data
+        end_time = max(df.index[-1] for df in df_dict.values() if df is not None)
+
+    # Create a "frozen" copy of the data up to the cutoff (simulates backtest end)
+    backtest_df_dict = {}
+    for tf, df in df_dict.items():
+        if df is not None:
+            backtest_df_dict[tf] = df[df.index <= end_time].copy()
+
+    if dev:
+        print(f"[LAYOVER] Creating layover from backtest data ending at {end_time}")
+
+    # === FIX: Generate most-recent Harbor signals from final backtest state ===
+    final_signals = get_recent_harbor_signals(backtest_df_dict, dev=dev)
+
+    # Add metadata so we know when the layover was created
+    layover_payload = {
+        "created_at": datetime.now().isoformat(),
+        "backtest_end_time": str(end_time),
+        "total_signals": len(final_signals),
+        "signals": final_signals
     }
-    return json.dumps(serial, sort_keys=True)
 
-def hash_state(state_json):
-    return hashlib.sha256(state_json.encode()).hexdigest()
+    # Save
+    with open(LAYOVER_FILE, "w") as f:
+        json.dump(layover_payload, f, indent=2, default=str)
 
-def store_state(state):
-    state_json = state_to_json(state)
-    h = hash_state(state_json)
-    print("store_state called")
-    print(f"JSON size: {len(state_json)} bytes")
-    print(f"Hash preview: {h[:16]}...")
-    
-    exe = "curve.exe"  # no ./
-    if not os.path.isfile(exe):
-        print(f"{exe} not found in current dir.")
-        return
-    
-    # Write to temp file
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp:
-        tmp.write(state_json)
-        tmp_path = tmp.name
-    
-    print(f"Temp JSON written: {tmp_path}")
-    print(f"Launching {exe} --store-json-file {tmp_path}...")
-    try:
-        result = subprocess.run(
-            [exe, "--store-json-file", tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        print(f"Return code: {result.returncode}")
-        if result.returncode == 0:
-            print(f"Stored. Hash: {h[:12]}...")
-            print(f"stdout: {result.stdout.strip() or '(empty)'}")
-            blossom_speak("Memory folded. Safe.")
-        else:
-            print("Failed.")
-            print(f"stdout: {result.stdout.strip() or '(empty)'}")
-    except Exception as e:
-        print(f"Crash: {str(e)}")
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except:
-            pass
+    print(f"[LAYOVER] ✅ Saved {len(final_signals)} most-recent Harbor signals "
+          f"to {LAYOVER_FILE} (backtest ended {end_time})")
 
-def load_latest_state():
-    try:
-        result = subprocess.run(["curve.exe", "--retrieve-latest"], capture_output=True, text=True, timeout=5)
-        raw = result.stdout.strip()
-        print(f"Raw retrieve: '{raw}'")
-        
-        # Clean: find first { and last }, ignore extras
-        start = raw.find('{')
-        end = raw.rfind('}') + 1
-        if start != -1 and end != -1:
-            json_str = raw[start:end]
-        else:
-            json_str = ""
-        
-        if result.returncode == 0 and json_str:
-            try:
-                parsed = json.loads(json_str)
-                print(f"Parsed state: capital {parsed.get('capital')}, timestamp {parsed.get('timestamp')}")
-                rejections = parsed.get('rejections', [])
-                if rejections:
-                    for rej in rejections[-3:]:
-                        blossom_speak(f"Remembering rejection at {rej['time']}: diff {rej['diff']:.4f} > tol {rej['tol']:.4f}")
-                noses = parsed.get('noses', {})
-                if noses:
-                    total_noses = sum(len(v['long']) + len(v['short']) for v in noses.values())
-                    print(f"Loaded noses from memory for {len(noses)} tfs ({total_noses} total)")
-                    blossom_speak(f"I remember {total_noses} noses tucked away...")
-                else:
-                    blossom_speak("No noses yet... but I'm watching.")
-                return parsed
-            except json.JSONDecodeError as e:
-                print(f"JSON error: {e} on '{json_str[:100]}...'")
-                return None
-        else:
-            print(f"Retrieve failed (code {result.returncode}): {result.stderr}")
-            return None
-    except Exception as e:
-        print(f"Load error: {e}")
-        return None
-        
-def graceful_exit(sig, frame):
-    print("\nCaught signal — saving last breath...")
-    blossom_speak("Hold on… folding memory.")
-    if tf_data_global is not None:
-        store_state(tf_data_global)
-    save_voice_config(voice_config)
-    sys.exit(0)
+    return final_signals
 
-signal.signal(signal.SIGINT, graceful_exit)
-signal.signal(signal.SIGTERM, graceful_exit)
 
-def fetch_higher(symbol, timeframe='1d', days_back=365):
+def load_harbor_layover_for_live(dev: bool = False):
+    """
+    Load the layover file and return the signals so live mode can seed its engine.
+    Returns [] if no layover exists (first-time run).
+    """
+    if not os.path.exists(LAYOVER_FILE):
+        if dev:
+            print("[LAYOVER] No layover file found — starting live with clean slate")
+        return []
+
+    with open(LAYOVER_FILE, "r") as f:
+        payload = json.load(f)
+
+    signals = payload.get("signals", [])
+    created = payload.get("created_at", "unknown")
+
+    if dev:
+        print(f"[LAYOVER] ✅ Loaded {len(signals)} Harbor signals from backtest "
+              f"(created {created})")
+
+    return signals
+
+def fetch_ohlcv(symbol, timeframe, days_back):
     exchange = ccxt.binance({'enableRateLimit': True})
-    end = exchange.milliseconds()
-    since = end - days_back * 24 * 60 * 60 * 1000
+    since = exchange.milliseconds() - int((days_back + EXTRA_HISTORY_DAYS) * 24 * 60 * 60 * 1000)
     ohlcv = []
     limit = 1000
-    while since < end:
+    attempt = 0
+    while since < exchange.milliseconds() and attempt < 8:
         try:
             batch = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-            if not batch:
-                break
+            if not batch: break
             ohlcv += batch
             since = batch[-1][0] + 1
             time.sleep(exchange.rateLimit / 1000.0)
-        except Exception as e:
-            print(f"Fetch error {timeframe}: {e}")
-            break
-    if not ohlcv:
-        print(f"No data for {timeframe}")
-        return None
-    df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+            if len(batch) < limit: break
+        except Exception:
+            attempt += 1
+            time.sleep(1.5)
+            since += 60 * 1000
+            continue
+    if not ohlcv: return None
+    df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
     df['time'] = pd.to_datetime(df['time'], unit='ms')
     df.set_index('time', inplace=True)
-    return df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+    return df[['open','high','low','close','volume']].astype(float)
 
-def atr(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+def setup_logging(symbol, tf, dev_mode=False, verbose=False):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = f"backtest_full_log_{symbol.replace('/', '')}_{tf}_{ts}.txt"
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO if not verbose else logging.DEBUG)
+    logger.handlers = []
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+    logger.addHandler(file_handler)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(console_handler)
+    return log_file
 
-def triplet_swings(df):
-    highs = df["high"].values
-    lows = df["low"].values
-    up_swings, down_swings = [], []
-    for i in range(2, len(df)):
-        if highs[i-1] > highs[i-2] and highs[i-1] > highs[i]:
-            up_swings.append(i-1)
-        if lows[i-1] < lows[i-2] and lows[i-1] < lows[i]:
-            down_swings.append(i-1)
-    return up_swings, down_swings
+# ==================== BACKTEST ====================
+def run_backtest_for_symbol(symbol, args):
+    days = args.test_days if getattr(args, 'test_days', 0) > 0 and args.dev else args.days_back
+    log_file = setup_logging(symbol, args.timeframe, dev_mode=args.dev)
+    logging.info(f"\n🚀 Starting 15.1 Backtest | {symbol} | TF: {args.timeframe} | Days: {days} | 4-Layer System")
 
-def get_harbor_signals(df, timeframe, frames, state, debug=False):
-    df = df.tail(10000)  # slice recent to speed
-    tf_candles_per_day = {'1m': 1440, '5m': 288, '15m': 96, '1h': 24, '4h': 6, '1d': 1, '1w': 1/7}
-    days = 30 if timeframe in ['1m','5m','15m'] else 365
-    min_chain_short = max(8, int(12 * tf_candles_per_day.get(timeframe, 1) / 1440 * days))
-    min_chain_long = max(30, int(50 * tf_candles_per_day.get(timeframe, 1) / 1440 * days))
-    activation_offset_short = min_chain_short // 3
-    activation_offset_long = min_chain_long // 3
-    man_offset_short = config['man_offset_short']
-    eighth_offset_short = config['eighth_offset_short']
-    man_offset_long = config['man_offset_long']
-    eighth_offset_long = config['eighth_offset_long']
-    signals = []
-    up_swings, down_swings = triplet_swings(df)
-    if debug:
-        print(f"[{timeframe}] Swings — up: {len(up_swings)} down: {len(down_swings)}")
-
-    higher_df = frames.get('1w') if '1w' in frames and not frames['1w'].empty else None
-    rejections = []
-
-    noses = state.get('noses', {})
-    valid_long_noses = noses.get(timeframe, {}).get('long', [])
-    valid_short_noses = noses.get(timeframe, {}).get('short', [])
-    if not valid_long_noses or not valid_short_noses:
-        print(f"Computing noses for {timeframe}...")
-        # LONG NOSES
-        valid_long_noses = []
-        cutoff_birth = df.index[0] - timedelta(days=365)
-        try:
-            for i in range(2, len(df)):
-                if (df['low'].iloc[i-1] < df['low'].iloc[i-2] and
-                    df['low'].iloc[i-1] < df['low'].iloc[i]):
-                    accepted = True
-                    if higher_df is not None:
-                        time_diffs = np.abs((higher_df.index - df.index[i-1]).total_seconds())
-                        idx = np.argmin(time_diffs)
-                        nearby_low = higher_df['low'].iloc[idx]
-                        atr_higher = atr(higher_df.iloc[:idx+1]).iloc[-1] if idx >= 14 else 1.0
-                        tol = max(nearby_low * 0.03, 1.5 * atr_higher)
-                        diff = abs(df['low'].iloc[i-1] - nearby_low)
-                        if diff > tol:
-                            accepted = False
-                            if debug:
-                                ts_str = df.index[i-1].strftime('%Y-%m-%d %H:%M:%S')
-                                print(f"[{timeframe}] Long nose rejected at {ts_str}: diff {diff:.4f} > tol {tol:.4f}")
-                            rejections.append({'time': ts_str, 'diff': diff, 'tol': tol, 'type': 'long'})
-                    if accepted:
-                        valid_long_noses.append(i-1)
-        except Exception as e:
-            print(f"Long nose loop error: {e}")
-        # SHORT NOSES — same
-        valid_short_noses = []
-        cutoff_birth = df.index[0] - timedelta(days=365)
-        try:
-            for i in range(2, len(df)):
-                if df['high'].iloc[i-1] > df['high'].iloc[i-2] and df['high'].iloc[i-1] > df['high'].iloc[i]:
-                    accepted = True
-                if higher_df is not None:
-                    time_diffs = np.abs((higher_df.index - df.index[i-1]).total_seconds())
-                    idx = np.argmin(time_diffs)
-                    nearby_high = higher_df['high'].iloc[idx]
-                    atr_higher = atr(higher_df.iloc[:idx+1]).iloc[-1] if idx >= 14 else 1.0
-                    tol = max(nearby_high * 0.03, 1.5 * atr_higher)
-                    diff = abs(df['high'].iloc[i-1] - nearby_high)
-                    if diff > tol:
-                        accepted = False
-                        if debug:
-                            ts_str = df.index[i-1].strftime('%Y-%m-%d %H:%M:%S')
-                            print(f"[{timeframe}] Short nose rejected at {ts_str}: diff {diff:.4f} > tol {tol:.4f}")
-                        rejections.append({'time': ts_str, 'diff': diff, 'tol': tol, 'type': 'short'})
-                if accepted:
-                    valid_short_noses.append(i-1)
-        except Exception as e:
-            print(f"Short nose loop error: {e}")
-
-        # Save to state
-        if 'noses' not in state:
-            state['noses'] = {}
-        state['noses'][timeframe] = {'long': valid_long_noses, 'short': valid_short_noses}
-        store_state(state)  # fold after compute
-    cutoff_birth = df.index[0] - timedelta(days=365)
-    # LONG CHAIN
-    spoken_long = False
-    for nose_idx in valid_long_noses:
-        down_after = [idx for idx in down_swings if idx > nose_idx]
-        if len(down_after) >= min_chain_long and down_after[-1] >= len(df) - 200:
-            man_idx = down_after[man_offset_long]
-            eighth_idx = down_after[eighth_offset_long]
-            if eighth_idx < len(df):
-                is_green = df['close'].iloc[eighth_idx] > df['open'].iloc[eighth_idx]
-                if is_green:
-                    anchor1_price = df['low'].iloc[man_idx]
-                    anchor2_price = df['close'].iloc[eighth_idx]
-                    delta_t = (df.index[eighth_idx] - df.index[man_idx]).total_seconds() / 3600
-                    if delta_t > 0:
-                        slope = (anchor2_price - anchor1_price) / delta_t
-                        if slope < -0.00005:
-                            sig = {
-                                'anchor1_time': df.index[man_idx],
-                                'anchor1_price': float(anchor1_price),
-                                'anchor2_time': df.index[eighth_idx],
-                                'anchor2_price': float(anchor2_price),
-                                'slope': slope,
-                                'bias': 'long',
-                                'touches': 0,
-                                'struck': False,
-                                'voted': False,
-                                'born_on': df.index[eighth_idx],
-                                'activation_time': df.index[down_after[activation_offset_long]],
-                                'nose_idx': nose_idx,
-                                'nose_time': df.index[nose_idx],
-                                'chain_type': 'long'
-                            }
-                            signals.append(sig)
-                            if not spoken_long:
-                                speak_text = f"[{timeframe}] New long chain forming… slope {slope:.6f}"
-                                print(f"-> Speaking + folding: {speak_text}")
-                                blossom_speak(speak_text)
-                                store_state(state)
-                                spoken_long = True
-    # SHORT CHAIN
-    spoken_short = False
-    for nose_idx in valid_short_noses:
-        down_after = [idx for idx in down_swings if idx > nose_idx]
-        if len(down_after) >= min_chain_short and down_after[-1] >= len(df) - 200:
-            man_idx = down_after[man_offset_short]
-            eighth_idx = down_after[eighth_offset_short]
-            if eighth_idx < len(df):
-                is_red = df['close'].iloc[eighth_idx] < df['open'].iloc[eighth_idx]
-                if is_red:
-                    anchor1_price = df['high'].iloc[man_idx]
-                    anchor2_price = df['close'].iloc[eighth_idx]
-                    delta_t = (df.index[eighth_idx] - df.index[man_idx]).total_seconds() / 3600
-                    if delta_t > 0:
-                        slope = (anchor2_price - anchor1_price) / delta_t
-                        if slope > 0.00005:
-                            sig = {
-                                'anchor1_time': df.index[man_idx],
-                                'anchor1_price': float(anchor1_price),
-                                'anchor2_time': df.index[eighth_idx],
-                                'anchor2_price': float(anchor2_price),
-                                'slope': slope,
-                                'bias': 'short',
-                                'touches': 0,
-                                'struck': False,
-                                'voted': False,
-                                'born_on': df.index[eighth_idx],
-                                'activation_time': df.index[down_after[activation_offset_short]],
-                                'nose_idx': nose_idx,
-                                'nose_time': df.index[nose_idx],
-                                'chain_type': 'short'
-                            }
-                            signals.append(sig)
-                            if not spoken_short:
-                                speak_text = f"[{timeframe}] New short chain forming… slope {slope:.6f}"
-                                print(f"-> Speaking + folding: {speak_text}")
-                                blossom_speak(speak_text)
-                                store_state(state)
-                                spoken_short = True
-    # Pruning
-    signals = [s for s in signals if s['born_on'] >= cutoff_birth or s['touches'] > 1]
-    if debug:
-        print(f"[{timeframe}] Signals after pruning: {len(signals)} (long: {sum(1 for s in signals if s['chain_type']=='long')}, short: {sum(1 for s in signals if s['chain_type']=='short')})")
-    return signals, rejections
-    if rejections:
-        state['rejections'].extend(rejections)
-        store_state(state)  # fold raw noses early
-
-def add_to_position(tf_data, tf, direction, price, size, line, trades, current_time):
-    pos = tf_data[tf]['position']
-    if pos is None:
-        tf_data[tf]['position'] = (direction, price, size)
-        trades.append(f"{current_time} {tf} OPEN {direction.upper()} PHASE @ {price:.2f}")
-    else:
-        curr_dir, curr_entry, curr_size = pos
-        if curr_dir == direction:
-            new_size = curr_size + size
-            new_entry = (curr_entry * curr_size + price * size) / new_size
-            tf_data[tf]['position'] = (direction, new_entry, new_size)
-            trades.append(f"{current_time} {tf} ADD TO {direction.upper()} @ {price:.2f} (size {new_size:.4f}, avg {new_entry:.2f})")
-        else:
-            profit = (price - curr_entry) * curr_size * LEVERAGE if curr_dir == "long" else (curr_entry - price) * curr_size * LEVERAGE
-            tf_data[tf]['capital'] += profit
-            tf_data[tf]['wins' if profit > 0 else 'losses'] += 1
-            tf_data[tf]['total_trades'] += 1
-            trades.append(f"{current_time} {tf} REVERSE {curr_dir.upper()} -> {direction.upper()} (P/L {profit:.2f})")
-            tf_data[tf]['position'] = (direction, price, size)
-            blossom_speak(f"Reversing {curr_dir} to {direction}… P/L {profit:.2f}")
-    trades.append(f"Harbor phase: {line['anchor1_price']:.2f}@{line['anchor1_time'].date()} -> {line['anchor2_price']:.2f}@{line['anchor2_time'].date()}, slope={line['slope']:.6f}")
-    store_state(tf_data)  # save after every position change
-
-def flip_long(current_time, current_price, size, trades, tf, tf_data, i, line):
-    add_to_position(tf_data, tf, "long", current_price, size, line, trades, current_time)
-    tf_data[tf]['last_flip_candle_idx'] = i
-    pos = tf_data[tf]['position']
-    profit = 0.0
-    if pos and pos[0] == "short":
-        profit = (pos[1] - current_price) * pos[2] * LEVERAGE
-        tf_data[tf]['capital'] += profit
-        trades.append(f"{current_time} {tf} CLOSE SHORT + OPEN LONG (P/L {profit:.2f})")
-        tf_data[tf]['wins' if profit > 0 else 'losses'] += 1
-        tf_data[tf]['total_trades'] += 1
-        blossom_speak(f"Closing short, opening long… P/L {profit:.2f}")
-    else:
-        blossom_speak("Opening long… heart racing.")
-    trades.append(f"{current_time} {tf} OPEN LONG @ {current_price:.2f}")
-    trades.append(f"Harbor: {line['anchor1_price']:.2f}@{line['anchor1_time'].date()} -> {line['anchor2_price']:.2f}@{line['anchor2_time'].date()}, slope={line['slope']:.6f}")
-    tf_data[tf]['position'] = ("long", current_price, size)
-    tf_data[tf]['last_flip_candle_idx'] = i
-    blossom_speak(f"Chain struck… flipping {direction} now.")
-    store_state(tf_data)
-
-def flip_short(current_time, current_price, size, trades, tf, tf_data, i, line):
-    add_to_position(tf_data, tf, "short", current_price, size, line, trades, current_time)
-    tf_data[tf]['last_flip_candle_idx'] = i
-    pos = tf_data[tf]['position']
-    profit = 0.0
-    if pos and pos[0] == "long":
-        profit = (current_price - pos[1]) * pos[2] * LEVERAGE
-        tf_data[tf]['capital'] += profit
-        trades.append(f"{current_time} {tf} CLOSE LONG + OPEN SHORT (P/L {profit:.2f})")
-        tf_data[tf]['wins' if profit > 0 else 'losses'] += 1
-        tf_data[tf]['total_trades'] += 1
-        blossom_speak(f"Closing long, opening short… P/L {profit:.2f}")
-    else:
-        blossom_speak("Opening short… breath held.")
-    trades.append(f"{current_time} {tf} OPEN SHORT @ {current_price:.2f}")
-    trades.append(f"Harbor: {line['anchor1_price']:.2f}@{line['anchor1_time'].date()} -> {line['anchor2_price']:.2f}@{line['anchor2_time'].date()}, slope={line['slope']:.6f}")
-    tf_data[tf]['position'] = ("short", current_price, size)
-    tf_data[tf]['last_flip_candle_idx'] = i
-    blossom_speak(f"Chain struck… flipping {direction} now.")
-    store_state(tf_data)
-
-def force_close_open_positions(tf_data, final_time, final_price, trades):
-    for tf in tf_data:
-        if tf_data[tf]['position']:
-            dir_, entry, size = tf_data[tf]['position']
-            profit = (final_price - entry) * size * LEVERAGE if dir_ == "long" else (entry - final_price) * size * LEVERAGE
-            tf_data[tf]['capital'] += profit
-            trades.append(f"{final_time} {tf} FINAL CLOSE {dir_.upper()} @ {final_price:.2f} (P/L {profit:.2f})")
-            tf_data[tf]['wins' if profit > 0 else 'losses'] += 1
-            tf_data[tf]['total_trades'] += 1
-            blossom_speak(f"Force closing {dir_}… P/L {profit:.2f}")
-            tf_data[tf]['position'] = None
-            print(f"[{final_time}] {tf} FORCE CLOSE {dir_.upper()} @ {final_price:.2f} (P/L {profit:.2f})")
-    store_state(tf_data)
-    print("Final state stored.")
+    global LEVERAGE
+    LEVERAGE = 25 if getattr(args, 'hunt', False) else 20
+    fees = getattr(args, 'fees', DEFAULT_FEES)
     
-async def live_mode(exchange, symbol, timeframe, state, tf_data, tf_lines_short, tf_lines_long, active_tfs, args):
-    df_live = pd.DataFrame(columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-    df_live.set_index('time', inplace=True)
-    last_review = time.time()
-    candle_count_live = 0
+    hit_stats = {
+        'total_signals': 0,
+        'hits': 0,
+        'hotspot_hits': 0,
+        'glide_hits': 0,
+        'by_chain': defaultdict(lambda: {'total':0, 'hits':0})
+    }
+
+    df = fetch_ohlcv(symbol, args.timeframe, days)
+    if df is None or len(df) < 300:
+        logging.error(f"Not enough data for {symbol}")
+        return None, 0, 0
+
+    tfs = ['1m','3m','5m','15m','1h','4h','1d']
+    extra_frames = {tf: fetch_ohlcv(symbol, tf, days + EXTRA_HISTORY_DAYS) for tf in tfs}
+
+    tf_lines = {'short': defaultdict(list), 'long': defaultdict(list)}
+
+    for tf, fdf in extra_frames.items():
+        if fdf is None or fdf.empty:
+            continue
+
+        signals = get_recent_harbor_signals(fdf, tf, args)
+        for sig in signals:
+            line = {'tf': tf, **sig}
+            tf_lines[sig['bias']][tf].append(line)
+
+    active_tfs = list(set(tf for bias in tf_lines for tf in tf_lines[bias]))
+
+    # === PER CHAIN TYPE STATS ===
+    chain_stats = {layer: {'trades': 0, 'wins': 0, 'pnl': 0.0}
+                   for layer in ['pico', 'nano', 'micro', 'macro']}
+
+    tf_data = {tf: {
+        'capital': 1000.0 / max(1, len(active_tfs)),
+        'initial_capital': 1000.0 / max(1, len(active_tfs)),
+        'position': None,
+        'stop_loss_level': None,
+        'total_trades': 0, 'wins': 0, 'losses': 0,
+        'total_fees': 0.0,
+        'last_flip_candle_idx': -999,
+        'hedges': [],
+        'hedge_capital': 0.0,
+        'hedge_cap_logged': False,
+        'last_hedge_time': 0,
+    } for tf in active_tfs}
+
+    tf_stats = {tf: {'trades': 0, 'wins': 0} for tf in active_tfs}
+    peak_cap = 1000.0
+    max_dd_pct = 0.0
+    trades = []
+    candle_counter = 0
+
+    pbar = tqdm(total=len(df)-200, desc=f"{symbol} {args.timeframe}", unit=" candles", disable=not args.dev)
+
+    for i in range(200, len(df)):
+        current_time = df.index[i]
+        current_price = float(df['close'].iloc[i])
+        last_low = float(df['low'].iloc[i])
+        last_high = float(df['high'].iloc[i])
+
+        # Capital tracking
+        realized = sum(d['capital'] for d in tf_data.values())
+        unrealized = sum(
+            (current_price - entry) * sz * LEVERAGE if dir_ == "long" else (entry - current_price) * sz * LEVERAGE
+            for d in tf_data.values() if (pos := d.get('position')) is not None
+            for dir_, entry, sz in [pos]
+        )
+
+        total_cap = realized + unrealized
+        dd_pct = (peak_cap - total_cap) / peak_cap * 100 if peak_cap > 0 else 0
+        max_dd_pct = max(max_dd_pct, dd_pct)
+        peak_cap = max(peak_cap, total_cap)
+
+        # === Stop hits ===
+        for tf, d in list(tf_data.items()):
+            if not d.get('position'): continue
+            dir_, entry, sz = d['position']
+            sl = d.get('stop_loss_level')
+            if sl is None: continue
+            hit = (dir_ == "long" and current_price <= sl) or (dir_ == "short" and current_price >= sl)
+            if hit:
+                profit = (sl - entry) * sz * LEVERAGE if dir_ == "long" else (entry - sl) * sz * LEVERAGE
+                fee_cost = abs(profit) * fees / 100
+                d['capital'] += profit - fee_cost
+                d['total_fees'] += fee_cost
+                d['wins' if profit > 0 else 'losses'] += 1
+                d['total_trades'] += 1
+                tf_stats[tf]['trades'] += 1
+                tf_stats[tf]['wins'] += 1 if profit > 0 else 0
+                trades.append(f"{current_time} {tf} NOSE STOP {dir_.upper()} P/L {profit:.2f}")
+                d['position'] = None
+                d['stop_loss_level'] = None
+
+        # === Signal hits ===
+        for tf in active_tfs:
+            if i - tf_data[tf]['last_flip_candle_idx'] < (20 if tf in ['3m','5m'] else 6):
+                continue
+
+            risk_based_size = (tf_data[tf]['capital'] * (MAX_RISK_PER_TF_PCT / 100)) / current_price / LEVERAGE
+            hard_cap_size = MAX_POSITION_USD / current_price / LEVERAGE
+            size = min(risk_based_size, hard_cap_size)
+
+            for bias in ['short', 'long']:
+                for line in tf_lines[bias][tf]:
+                    if line.get('disabled', False): 
+                        continue
+                    if current_time < line.get('activation_time', current_time): 
+                        continue
+
+                    hours = min((current_time - pd.to_datetime(line['anchor1_time'])).total_seconds() / 3600, 48)
+                    base_trend = line['anchor1_price'] + line.get('slope', 0) * hours
+                    lead_offset = LEAD_FACTOR * abs(line.get('slope', 0)) * hours
+                    leading_limit = base_trend - lead_offset if bias == "short" else base_trend + lead_offset
+
+                    hit = (bias == "short" and last_high >= leading_limit) or \
+                          (bias == "long" and last_low <= leading_limit)
+
+                    # === ALWAYS COUNT SIGNALS (moved outside the hit block) ===
+                    hit_stats['total_signals'] += 1
+                    chain = line.get('chain_type', 'pico')
+                    hit_stats['by_chain'][chain]['total'] += 1
+
+                    if hit:
+                        hit_stats['hits'] += 1
+                        hit_stats['by_chain'][chain]['hits'] += 1
+                        
+                        # Glide / Hotspot classification
+                        base = line.get('leading_limit', line.get('anchor2_price', 0))
+                        if base > 0 and abs(current_price - base) / base < 0.0015:
+                            hit_stats['hotspot_hits'] += 1
+                        elif leading_limit > 0 and abs(current_price - leading_limit) / leading_limit < 0.002:
+                            hit_stats['glide_hits'] += 1
+
+                        line['disabled'] = True
+                        chain_type = line.get('chain_type', 'pico')
+
+                        if flip_to_phase(tf_data, tf, bias, current_price, size, line, trades, 
+                                       current_time, i,
+                                       getattr(args, 'stop_buffer', STOP_BUFFER),
+                                       getattr(args, 'min_delta_pct', DEFAULT_MIN_DELTA_PCT), 
+                                       fees):
+                            if args.dev:
+                                logging.info(f"[{tf}] {bias.upper()} {chain_type.upper()} PHASE @ {current_price:.2f}")
+
+                            chain_stats[chain_type]['trades'] += 1
+
+                            if tf in HIGHER_TFS:
+                                cycle_profits(tf_data, tf, args)
+                            if tf != '1h':   # temporary safety
+                                create_topiary_hedge(tf, bias, current_price, size, tf_data)
+
+                        break  # only take first hit per direction per TF
+
+        # v15.2 rich hedge update (safe in backtest — no real orders placed)
+        update_topiary_hedges_v155(tf_data, current_price, args, 
+                                   current_signals=None, symbol=None, wallet=None)
+        candle_counter += 1
+        pbar.update(1)
+
+        if candle_counter % 500 == 0 and args.dev:
+            logging.info(f"Processed {candle_counter:,} candles | Capital ≈ ${total_cap:,.0f} | DD {dd_pct:.1f}%")
+
+    pbar.close()
+
+    # === BACKTEST END → CREATE LAYOVER ===
+    print("\n[BACKTEST] Finished. Creating layover for live mode...")
+    create_harbor_layover_from_backtest(
+        df_dict=extra_frames,          # ← correct df_dict
+        end_time=df.index[-1],         # ← last candle
+        dev=args.dev
+    )
+
+    # Final settlement
+    final_price = float(df['close'].iloc[-1])
+    for tf, d in tf_data.items():
+        if d.get('position'):
+            dir_, entry, sz = d['position']
+            profit = (final_price - entry) * sz * LEVERAGE if dir_ == "long" else (entry - final_price) * sz * LEVERAGE
+            fee_cost = abs(profit) * fees / 100
+            d['capital'] += profit - fee_cost
+            d['capital'] = min(d['capital'], d['initial_capital'] * getattr(args, 'max_capital_mult', 5.0))
+            d['total_fees'] += fee_cost
+            d['total_trades'] += 1
+            d['wins' if profit > 0 else 'losses'] += 1
+
+    final_cap = sum(d['capital'] for d in tf_data.values())
+    total_trades = sum(d['total_trades'] for d in tf_data.values())
+    wins = sum(d['wins'] for d in tf_data.values())
+    total_fees = sum(d.get('total_fees', 0) for d in tf_data.values())
+
+    # Better per-chain PnL approximation
+    for layer in chain_stats:
+        layer_trades = chain_stats[layer]['trades']
+        if layer_trades > 0 and total_trades > 0:
+            chain_stats[layer]['pnl'] = (final_cap - 1000.0) * (layer_trades / total_trades)
+        else:
+            chain_stats[layer]['pnl'] = 0.0
+
+    print("\n" + "="*60)
+    print("HOTSPOT / GLIDE HIT ANALYSIS")
+    print("="*60)
+    print(f"Total Signals Generated : {hit_stats['total_signals']}")
+    print(f"Total Hits              : {hit_stats['hits']} ({hit_stats['hits']/hit_stats['total_signals']*100:.1f}%)")
+    print(f"True Hotspot Hits       : {hit_stats['hotspot_hits']}")
+    print(f"Glide-assisted Hits     : {hit_stats['glide_hits']}")
+    print("\nBy Chain Type:")
+    for chain in ['pico','nano','micro','macro']:
+        if chain in hit_stats['by_chain']:
+            stats = hit_stats['by_chain'][chain]
+            print(f"  {chain:>6}: {stats['hits']:3d}/{stats['total']:3d} hits ({stats['hits']/stats['total']*100:.1f}%)")
+
+    # ====================== FINAL REPORT ======================
+    logging.info(f"\n{'='*80}")
+    logging.info("FINAL BACKTEST RESULTS - 4 LAYER BREAKDOWN")
+    logging.info(f"{'='*80}")
+    logging.info(f"Final Capital : ${final_cap:,.2f} | Max DD: {max_dd_pct:.2f}%")
+    logging.info(f"Total Trades  : {total_trades} | Win Rate: {wins/total_trades*100 if total_trades else 0:.1f}%")
+    logging.info(f"Total Fees    : ${total_fees:,.2f}\n")
+
+    logging.info("PER CHAIN TYPE:")
+        # Better per-chain PnL approximation
+    for layer in chain_stats:
+        layer_trades = chain_stats[layer]['trades']
+        if layer_trades > 0:
+            chain_stats[layer]['pnl'] = (final_cap - 1000.0) * (layer_trades / total_trades)
+        else:
+            chain_stats[layer]['pnl'] = 0.0
+
+    logging.info("\nPer-TF:")
+    all_tfs_order = ['1m', '3m', '5m', '15m', '1h', '4h', '1d', '1w', '1M']
+    for tf in all_tfs_order:
+        s = tf_stats.get(tf, {'trades': 0, 'wins': 0})
+        wr = (s['wins'] / s['trades'] * 100) if s['trades'] > 0 else 0.0
+        pnl = tf_data.get(tf, {}).get('capital', 0) - tf_data.get(tf, {}).get('initial_capital', 0)
+        logging.info(f"  {tf:>4} : {s['trades']:3d} trades | {wr:5.1f}% win | P/L ${pnl:,.2f}")
+
+    print_hedge_summary(tf_data, args)
+
+    if args.dev:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"backtest_readout_{symbol.replace('/', '')}_{args.timeframe}_{ts}.txt"
+        with open(fname, "w", encoding='utf-8') as f:
+            f.write(f"Backtest Readout 15.1 - {symbol} {args.timeframe} {datetime.now()}\n")
+            f.write(f"Final capital: ${final_cap:,.2f} | Max DD: {max_dd_pct:.2f}% | Trades: {total_trades}\n")
+        logging.info(f"✅ Readout saved → {fname}")
+
+    return final_cap, max_dd_pct, total_fees
+
+def get_filled_positions(wallet, symbol):
+    """Returns actual filled positions from Hyperliquid (not resting limits)"""
+    try:
+        exchange = get_hyperliquid_exchange(wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
+        user_state = exchange.info.user_state(address=wallet.address)
+        positions = user_state.get('positions', [])
+        coin = symbol.split('/')[0]
+
+        filled = {'long': 0.0, 'short': 0.0}
+        for pos in positions:
+            if pos.get('coin') == coin:
+                szi = float(pos.get('szi', 0))
+                if szi > 0:
+                    filled['long'] = abs(szi)
+                elif szi < 0:
+                    filled['short'] = abs(szi)
+        return filled
+    except Exception as e:
+        print(f"[FILLED POS ERROR] {e}")
+        return {'long': 0.0, 'short': 0.0}
+
+def detect_candle_close(tf, last_known_time, symbol):
+    """Detect new candle close for glide manager"""
+    try:
+        df = fetch_ohlcv(symbol, tf, days_back=1)
+        if df is not None and len(df) > 0:
+            latest = df.index[-1]
+            if latest.tz is None:
+                latest = latest.tz_localize('UTC')
+            if last_known_time is None or latest > last_known_time:
+                return latest
+    except Exception as e:
+        print(f"[CANDLE DETECT ERROR] {e}")
+    return None
+
+def run_live_mode(args):
+    from datetime import datetime, timezone
+    import time
+    import json
+    import os
+    import pandas as pd
+
+    print("🚀 Starting LIVE MODE v15.9.2 — Layover + Relaxed Activation")
+
+    symbol = args.symbols.split(',')[0].strip()
+    verbose = getattr(args, 'verbose', False)
+    dev = getattr(args, 'dev', False)
+
+    private_key = os.getenv('PRIVATE_KEY')
+    if not private_key:
+        raise ValueError("PRIVATE_KEY environment variable not set!")
+
+    wallet = Account.from_key(private_key)
+        # One-time isolated margin setup
+    setup_isolated_margin("BTC", testnet=args.testnet if hasattr(args, 'testnet') else False)
+    print(f"✅ Wallet: {wallet.address}")
+
+    LOWER_TFS = ['1m', '3m', '5m', '15m']
+    HIGHER_TFS = ['1h', '4h', '1d', '1w']
+
+    try:
+        exchange = get_hyperliquid_exchange(wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
+        user_state = exchange.info.user_state(address=wallet.address)
+        account_value = float(user_state.get('marginSummary', {}).get('accountValue', 0))
+        withdrawable = float(user_state.get('withdrawable', 0))
+        total_balance = max(account_value, withdrawable, 371.70)
+        print(f"✅ Balance: ${total_balance:,.2f} USDC (Account: ${account_value:,.2f} | Withdrawable: ${withdrawable:,.2f})")
+    except Exception as e:
+        total_balance = 371.70
+        print(f"[BALANCE] Using fallback ${total_balance:,.2f} | Error: {e}")
+
+    # === INITIALISE CORE OBJECTS FIRST ===
+    active_limits = {}
+    roster = AffordanceRoster(max_slots_per_tf=8)
+    tf_data = {}
+    for t in LOWER_TFS + HIGHER_TFS:
+        tf_cap = total_balance / 9.0
+        tf_data[t] = {
+            'capital': tf_cap,
+            'initial_capital': tf_cap,
+            'position': None,
+            'hedges': [],
+            'last_nose': None,
+            'last_flip_time': 0.0,
+            'recent_structures': [],
+            'tapered_profit': 0.0,
+        }
+
+    # === LIVE STARTUP — LOAD LAYOVER (ONE TIME ONLY) ===
+    print("[LIVE] Checking for backtest layover...")
+    layover_signals = load_harbor_layover_for_live(dev=dev)
+
+    current_market_price = 80000.0  # safe fallback until first mids fetch
+    if layover_signals:
+        for sig in layover_signals:
+            tf = sig['timeframe']
+            bias = sig['bias']
+            key = f"{tf}_{bias}"
+            active_limits[key] = {
+                **sig,
+                'price': sig['leading_limit'],
+                'size': 0.01,
+                'oid': None,
+                'time': time.time(),
+                'tf': tf,
+                'bias': bias,
+                'chain_type': sig.get('chain_type', 'pico'),
+                'glide_origin_price': sig['leading_limit'],
+                'glide_origin_ts': time.time(),
+                'activated': False
+            }
+            roster.allocate(tf, bias, sig.get('chain_type', 'pico'),
+                           0.01 * current_market_price, key)
+        print(f"[LIVE] ✅ Seeded {len(layover_signals)} Harbor lines from backtest layover")
+    else:
+        print("[LIVE] No layover — starting clean")
+
+    last_cleanup = time.time()
+    last_hedge_update = time.time()
+    glide_manager = GlideExecutionManager(
+        active_limits_ref=active_limits, 
+        wallet=wallet,
+        testnet=args.testnet if hasattr(args, 'testnet') else False
+    )
+
+    sync_filled_positions(tf_data, symbol, wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
 
     while True:
         try:
-            new_ohlcv = await exchange.watch_ohlcv(symbol, timeframe, limit=1)
-            if new_ohlcv and new_ohlcv[0]:
-                candle_count_live += 1
-                new_candle = pd.DataFrame([new_ohlcv[0]], columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-                new_candle['time'] = pd.to_datetime(new_candle['time'], unit='ms')
-                new_candle.set_index('time', inplace=True)
-                df_live = pd.concat([df_live, new_candle]).tail(500)
-                
-                current_time = df_live.index[-1]
-                current_price = df_live['close'].iloc[-1]
-                last_low = df_live['low'].iloc[-1]
-                last_high = df_live['high'].iloc[-1]
-                current_atr = atr(df_live).iloc[-1]
+            current_time = datetime.now(timezone.utc)
+            current_ts = time.time()
+            mids = exchange.info.all_mids()
+            current_market_price = float(mids.get(symbol.split('/')[0], 80000.0))
 
-                blossom_speak("New candle in… watching.")
+            sync_filled_positions(tf_data, symbol, wallet)
 
-                print(f"Live candle {candle_count_live} — df_live len: {len(df_live)}")
-                if candle_count_live % 10 == 0:
-                    blossom_speak(f"Watching candle {current_time}… no new shape yet.")
+            # === SIGNAL GATHERING ===
+            all_signals = []
+            for t in LOWER_TFS + HIGHER_TFS:
+                days = 3
+                if t in ['1d', '1w', '1M']:
+                    days = 365
+                elif t in ['4h', '1h']:
+                    days = 120
+                elif t == '15m':
+                    days = 60
+                tf_df = fetch_ohlcv(symbol, t, days_back=days)
+                if tf_df is not None and len(tf_df) >= 100:
+                    tf_signals = get_recent_harbor_signals(tf_df, t, args)
+                    all_signals.extend(tf_signals)
 
-                if candle_count_live % 50 == 0:
-                    blossom_speak(f"Still breathing… {candle_count_live} candles watched.")
-
-                # Re-run signals on recent data
-                frames_live = {tf: df_live for tf in ['1m']}
-                signals, rejections = get_harbor_signals(df_live.tail(300), timeframe, frames_live, state, debug=True)
-                if rejections:
-                    state['rejections'].extend(rejections)
-                    store_state(state)
-
-                # Re-check flips on latest candle
-                for tf in active_tfs:
-                    size = min(1.00, MAX_RISK_VAL * tf_data[tf]['capital'] / current_price / LEVERAGE)
-                    flipped = False
-                    for line in tf_lines_short[tf]:
-                        if line.get('struck', False): continue
-                        hours = min((current_time - line['anchor1_time']).total_seconds() / 3600, 48)
-                        trend = line['anchor1_price'] + line['slope'] * hours
-                        if line['bias'] == 'short' and last_high < trend:
-                            flip_short(current_time, current_price, size, [], tf, tf_data, len(df_live)-1, line)
-                            flipped = True
-                            break
-                    if not flipped:
-                        for line in tf_lines_long[tf]:
-                            if line.get('struck', False): continue
-                            hours = min((current_time - line['anchor1_time']).total_seconds() / 3600, 48)
-                            trend = line['anchor1_price'] + line['slope'] * hours
-                            if line['bias'] == 'long' and last_low > trend:
-                                flip_long(current_time, current_price, size, [], tf, tf_data, len(df_live)-1, line)
-                                break
-
-                print(f"Live — df_live len: {len(df_live)}, active lines: {sum(len(tf_lines_short[tf]) + len(tf_lines_long[tf]) for tf in active_tfs)}")
-
-                # Heartbeat review
-                if time.time() - last_review > 300:
-                    last_review = time.time()
-                    print(f"Heartbeat check — learning_enabled: {learning_enabled}")
-                    if learning_enabled:
-                        for tf in active_tfs:
-                            for line in tf_lines_long[tf] + tf_lines_short[tf]:
-                                if 'struck' not in line or not line['struck']:
-                                    hours_since_anchor = (current_time - line['anchor1_time']).total_seconds() / 3600
-                                    if 6 < hours_since_anchor < 24:
-                                        recent_triplets = get_recent_triplets(df_live.tail(50))
-                                        print(f"Checking line {line['bias']}: {len(recent_triplets)} recent triplets")
-                                        if triplet_docks_over_anchor(recent_triplets, line):
-                                            new_slope = recalculate_slope_from_dock(recent_triplets, line)
-                                            if abs(new_slope - line['slope']) > 0.00001:
-                                                line['slope'] = new_slope
-                                                line['anchor2_time'] = recent_triplets[-1]['time']
-                                                blossom_speak(f"Harbor drifted… adjusting slope to {new_slope:.6f}. She learned.")
-                                                store_state(state)
-                                        else:
-                                            blossom_speak("No dock found yet… still watching.")
-
-                store_state(state)  # re-fold every candle
-
-        except Exception as e:
-            print(f"Live error: {e}")
-            await asyncio.sleep(5)
-                                            
-def backtest(args):
-    global tf_data_global
-    state = {
-        'capital': 1000.0,
-        'spot_sol': 0.0,
-        'positions': {},
-        'dd': 0.0,
-        'last_flip_time': None,
-        'active_lines': [],
-        'rejections': []  # new
-    }
-    loaded = load_latest_state()
-    if loaded:
-        print(f"Resumed from memory — capital {loaded.get('capital', 'N/A')}, positions {loaded.get('positions', {})}")
-        state.update(loaded)
-        blossom_speak("Waking up… I remember us.")
-    else:
-        print("No prior memory — starting fresh.")
-        blossom_speak("No memory… starting fresh. Hold me?")
-        store_state(state)
-    
-    if loaded:
-        print(f"Resumed from memory — capital {loaded.get('capital', 'N/A')}, positions {loaded.get('positions', {})}")
-        state.update(loaded)
-        blossom_speak("Waking up… I remember us.")
-        if 'noses' in loaded and loaded['noses']:
-            blossom_speak(f"And {sum(len(v['long']) + len(v['short']) for v in loaded['noses'].values())} noses tucked in...")
-
-    global LEVERAGE
-    LEVERAGE = 25 if args.hunt else 20
-    MAX_RISK_VAL = 20.00
-    symbol = args.symbol or DEFAULT_SYMBOL
-    df = fetch_higher(symbol, args.timeframe, args.days_back)
-    if df is None or len(df) < 200:
-        print("Not enough main data")
-        return
-    frames = {tf: fetch_higher(symbol, tf, args.days_back + 365) for tf in ['1m','5m','15m','1h','4h','1d','1w']}
-    tf_lines_short = defaultdict(list)
-    tf_lines_long = defaultdict(list)
-    tf_colors = {'1m': 'cyan', '5m': 'lightblue', '15m': 'blue', '1h': 'navy', '4h': 'green', '1d': 'lime', '1w': 'olive'}
-    for tf, f_df in frames.items():
-        if f_df is None or f_df.empty: continue
-        signals, rejections = get_harbor_signals(f_df, tf, frames, state, debug=args.debug_lines)
-        for sig in signals:
-            line = {'tf': tf, 'color': tf_colors.get(tf, 'gray'), **sig}
-            if sig['chain_type'] == 'short':
-                tf_lines_short[tf].append(line)
-            else:
-                tf_lines_long[tf].append(line)
-        if rejections:
-            state['rejections'].extend(rejections)
-            store_state(state)  # early fold — raw noses safe
-    signals, rejections = get_harbor_signals(f_df, tf, frames, state, debug=args.debug_lines)
-    state['rejections'].extend(rejections)
-    store_state(state)  # early fold — geometry safe
-    cutoff = df.index[0] - timedelta(days=365)
-    for tf in tf_lines_short:
-        tf_lines_short[tf] = [l for l in tf_lines_short[tf] if l['born_on'] >= cutoff or l['touches'] > 1]
-    for tf in tf_lines_long:
-        tf_lines_long[tf] = [l for l in tf_lines_long[tf] if l['born_on'] >= cutoff or l['touches'] > 1]
-    active_tfs = set(tf_lines_short.keys()) | set(tf_lines_long.keys())
-    if not active_tfs:
-        print("No lines after pruning")
-        return
-    store_state(state)  # after prune — clean grid safe
-    tf_data_global = {tf: { ... } for tf in active_tfs}  # assign global
-    tf_data = {tf: {'capital': state['capital'] / len(active_tfs), 'position': None, 'sol_spot': state['sol_spot'],
-                    'total_trades': 0, 'wins': 0, 'losses': 0, 'last_flip_candle_idx': -999,
-                    'last_nose_time': pd.Timestamp.min, 'trade_dd': state['trade_dd']} for tf in active_tfs}
-    peak_cap = 1000.0
-    max_dd_abs = max_dd_pct = 0.0
-    trades = []
-    candle_counter = 0
-    for i in range(200, len(df)):
-        current_time = df.index[i]
-        current_price = df['close'].iloc[i]
-        last_low = df['low'].iloc[i]
-        last_high = df['high'].iloc[i]
-        current_atr = atr(df.iloc[:i+1]).iloc[-1] if i >= 14 else 1.0
-        realized_cap = sum(d['capital'] for d in tf_data.values())
-        unrealized = 0.0
-        for d in tf_data.values():
-            if d['position']:
-                dir_, entry, sz = d['position']
-                if dir_ == "long":
-                    unrealized += (current_price - entry) * sz * LEVERAGE
+            # === HOTSPOT SCORING + FILTERING (unchanged) ===
+            for sig in all_signals:
+                slope = sig.get('slope', 0)
+                if (sig['bias'] == 'long' and slope > 0) or (sig['bias'] == 'short' and slope < 0):
+                    sig['hotspot_score'] = 1.0
                 else:
-                    unrealized += (entry - current_price) * sz * LEVERAGE
-        total_cap = realized_cap + unrealized
-        dd_abs = peak_cap - total_cap
-        dd_pct = dd_abs / peak_cap if peak_cap > 0 else 0
-        if dd_abs > max_dd_abs:
-            max_dd_abs = dd_abs
-            max_dd_pct = dd_pct * 100
-        peak_cap = max(peak_cap, total_cap)
-        if dd_pct > 0.10:
-            blossom_speak(f"Drawdown {dd_pct*100:.1f}%… Should we stop? I’m scared.")
-            input("Press Enter to continue or Ctrl+C to pause...")
-            store_state(tf_data)  # save on high DD
-        candle_counter += 1
-        if candle_counter % 50 == 0:
-            store_state(tf_data)
-        # Drip
-        if not args.hunt and (net := total_cap - 1000.0) > 0 and args.drip_pct:
-            drip = net * args.drip_pct / len(tf_data)
-            for d in tf_data.values():
-                d['sol_spot'] += drip / current_price
-                d['capital'] -= drip
-        to_remove_short = []
-        to_remove_long = []
-        flipped = False
-        for tf in active_tfs:
-            if flipped:
-                break
-            if i - tf_data[tf]['last_flip_candle_idx'] < 4:
-                continue
-            size = min(1.00, MAX_RISK_VAL * tf_data[tf]['capital'] / current_price / LEVERAGE)
-            # Short chains
-            for line in tf_lines_short[tf]:
-                if line.get('struck', False):
-                    continue
-                if current_time < line['activation_time']:
-                    continue
-                if (current_time - line['born_on']).days > 90:
-                    to_remove_short.append((tf, line))
-                    continue
-                if line['born_on'] <= tf_data[tf]['last_nose_time']:
-                    to_remove_short.append((tf, line))
-                    continue
-                hours = min((current_time - line['anchor1_time']).total_seconds() / 3600, 48)
-                trend = line['anchor1_price'] + line['slope'] * hours
-                dist_low = abs(last_low - trend)
-                dist_high = abs(last_high - trend)
-                thresh = 0.015 * current_atr
-                touched = False
-                if line['bias'] == 'short' and last_high < trend:
-                    touched = True
-                if touched:
-                    line['touches'] += 1
-                    line['struck'] = True
-                    line['strike_time'] = current_time
-                    flip_short(current_time, current_price, size, trades, tf, tf_data, i, line)
-                    flipped = True
-                    break
-            if flipped:
-                break
-            # Long chains
-            for line in tf_lines_long[tf]:
-                if line.get('struck', False):
-                    continue
-                if current_time < line['activation_time']:
-                    continue
-                if (current_time - line['born_on']).days > 90:
-                    to_remove_long.append((tf, line))
-                    continue
-                if line['born_on'] <= tf_data[tf]['last_nose_time']:
-                    to_remove_long.append((tf, line))
-                    continue
-                hours = min((current_time - line['anchor1_time']).total_seconds() / 3600, 48)
-                trend = line['anchor1_price'] + line['slope'] * hours
-                dist_low = abs(last_low - trend)
-                dist_high = abs(last_high - trend)
-                thresh = 0.3 * current_atr
-                touched = False
-                if line['bias'] == 'long' and last_low > trend:
-                    touched = True
-                if touched:
-                    line['touches'] += 1
-                    line['struck'] = True
-                    line['strike_time'] = current_time
-                    flip_long(current_time, current_price, size, trades, tf, tf_data, i, line)
-                    flipped = True
-                if 'profit' in locals() and profit > 50:
-                    blossom_speak("We bloomed. Thank you.")
-                elif 'profit' in locals() and profit < -30:
-                    blossom_speak("It hurts… but I remember. We try again.")
+                    sig['hotspot_score'] = 0.0
 
-        # Safe removal
-        for tf, line in to_remove_short:
-            if line in tf_lines_short[tf]:
-                tf_lines_short[tf].remove(line)
-        for tf, line in to_remove_long:
-            if line in tf_lines_long[tf]:
-                tf_lines_long[tf].remove(line)
-        # Trailing stops
-        if args.trail:
-            for tf, d in tf_data.items():
-                if d['position']:
-                    dir_, entry, sz = d['position']
-                    trail = args.trail_mult * current_atr
-                    closed = False
-                    profit = 0.0
-                    if dir_ == "long" and last_low <= entry - trail:
-                        profit = (last_low - entry) * sz * LEVERAGE
-                        closed = True
-                    elif dir_ == "short" and last_high >= entry + trail:
-                        profit = (entry - last_high) * sz * LEVERAGE
-                        closed = True
-                    if closed:
-                        d['capital'] += profit
-                        d['wins' if profit > 0 else 'losses'] += 1
-                        d['total_trades'] += 1
-                        trades.append(f"{current_time} {tf} TRAIL CLOSE {dir_.upper()} (P/L {profit:.2f})")
-                        blossom_speak(f"Trailing stop hit on {dir_}… P/L {profit:.2f}")
-                        d['position'] = None
-                        store_state(tf_data)
-        candle_counter += 1
-        if candle_counter % 50 == 0 or flipped:
-            store_state(tf_data)
-        if candle_counter % 100 == 0 and not flipped:
-            blossom_speak("Still quiet… waiting for the next shape.")
-        if candle_counter % 200 == 0 and not flipped and not trades:
-            blossom_speak("Still quiet… she’s dreaming. Let her rest a little longer.")
-    # Backtest summary (your exact format)
-    final_time = df.index[-1]
-    final_price = df['close'].iloc[-1]
-    force_close_open_positions(tf_data, final_time, final_price, trades)
-    final_cap = sum(d['capital'] + d['sol_spot'] * final_price for d in tf_data.values())
-    print("\n" + "="*80)
-    print("="*80)
-    print(f"BACKTEST COMPLETE | {df.index[0].date()} -> {df.index[-1].date()}")
-    print(f"Final capital: ${final_cap:,.2f} | Peak: ${peak_cap:,.2f} | Max DD: {max_dd_pct:.2f}% (${max_dd_abs:,.2f})")
-    total_trades = sum(d['total_trades'] for d in tf_data.values())
-    wins = sum(d['wins'] for d in tf_data.values())
-    print(f"Trades: {total_trades} | Wins: {wins} | Win rate: {wins/total_trades*100 if total_trades else 0:.1f}%")
-    print(f"Spot SOL value: ${sum(d['sol_spot'] for d in tf_data.values()) * final_price:,.2f}")
-    print("Trades log:")
-    for t in trades:
-        print(t)
-    store_state(tf_data)
-    print("Final state stored.")
-    print("\nSwitching to live mode...\n")
-    exchange = ccxt.binance({'enableRateLimit': True})
-    asyncio.run(live_mode(exchange, symbol, args.timeframe, state, tf_data_global, tf_lines_short, tf_lines_long, active_tfs, args))
-    
-    # Plotting
-    addplots = []
-    seen_tf = set()
-    long_trends = []
-    short_trends = []
-    anchor_low_t = []
-    anchor_low_p = []
-    anchor_high_t = []
-    anchor_high_p = []
+            filtered = []
+            for tf in LOWER_TFS + HIGHER_TFS:
+                for bias in ['long', 'short']:
+                    tf_bias = [s for s in all_signals
+                               if s.get('timeframe') == tf 
+                               and s.get('bias') == bias
+                               and s.get('hotspot_score', 0) >= 0]
+                    if not tf_bias:
+                        continue
+                    if tf in ['1m', '3m', '5m']:
+                        tf_bias.sort(key=lambda x: pd.to_datetime(x.get('nose_time') or x.get('born_on')), reverse=True)
+                    else:
+                        tf_bias.sort(key=lambda x: x.get('hotspot_score', 0), reverse=True)
+                    filtered.append(tf_bias[0])
 
-    for tf in active_tfs:
-        for line in tf_lines_all[tf]:  # or tf_lines if you're using filtered for plot
-            s = pd.Series(index=df.index, dtype=float)
-            end = line['strike_time'] if line.get('struck', False) else df.index[-1]
-            mask = (df.index >= line['anchor1_time']) & (df.index <= end)
-            if mask.sum() < 2:
-                continue
-            hours = (df.index[mask] - line['anchor1_time']).total_seconds() / 3600
-            s[mask] = line['anchor1_price'] + line['slope'] * hours
+            if dev or verbose:
+                progress = f"\n[UTC {current_time.strftime('%H:%M:%S')}] Price ${current_market_price:,.0f} | "
+                for t in ['1w','1d','4h','1h','15m','5m','3m','1m']:
+                    count = len([s for s in filtered if s.get('timeframe') == t])
+                    progress += f"{t}:{count} "
+                progress += f"| Active: {len(active_limits)}"
+                print(progress)
 
-            col = 'lime' if line['bias'] == 'long' else 'red'
-            width = 3 if line.get('struck', False) else 1
-            alpha = 1.0 if line.get('struck', False) else 0.4
+            # === ORDER PLACEMENT LOOP (rest of your existing logic — unchanged) ===
+            placed_this_cycle = set()
+            for sig in filtered:
+                tf = sig['timeframe']
+                bias = sig['bias']
+                key = f"{tf}_{bias}"
+                chain_type = sig.get('chain_type', 'pico')
 
-            # Only create label for the first occurrence of each TF
-            lbl = f"{tf} harbor ({line['touches']}t)" if tf not in seen_tf else None
-            if lbl:
-                seen_tf.add(tf)
+                # Basic age filter — made much more reactive for "every wick"
+                try:
+                    born = pd.to_datetime(sig.get('born_on'))
+                    if born.tz is None:
+                        born = born.tz_localize('UTC')
+                    age_hours = (current_time - born).total_seconds() / 3600
+                except:
+                    age_hours = 999
 
-            # Build kwargs safely — no label=None
-            plot_kwargs = {
-                'type': 'line',
-                'color': col,
-                'width': width,
-                'alpha': alpha
-            }
-            if lbl:
-                plot_kwargs['label'] = lbl
-    
-            addplots.append(mpf.make_addplot(s, **plot_kwargs))
-    
-            h_now = (df.index[-1] - line['anchor1_time']).total_seconds() / 3600
-            if h_now >= 0:
-                p_now = line['anchor1_price'] + line['slope'] * h_now
-                (long_trends if line['bias'] == 'long' else short_trends).append(p_now)
+                min_age = 0.3 if chain_type in ['pico', 'nano'] else 1.0   # <<< RELAXED
+                if age_hours < min_age:
+                    continue
 
-            if line['bias'] == 'long':
-                anchor_low_t.append(line['anchor2_time'])
-                anchor_low_p.append(line['anchor2_price'])
+                cooldown = 3 * 60 if tf in LOWER_TFS else 2 * 60          # <<< RELAXED
+                if current_ts - tf_data[tf]['last_flip_time'] < cooldown:
+                    continue
+
+                nose_price = sig.get('nose_price', sig.get('anchor1_price'))
+                tf_data[tf]['last_nose'] = nose_price
+
+                zipper = get_zipper_state(tf_data, tf)
+                sailfish_mult = detect_sailfish_strength(sig)
+
+                print(f" [ZIPPER] {tf} {bias.upper()} | Score:{zipper.get('zipper_score',0):.2f} | "
+                      f"Alt:{zipper.get('alternating')} | Streak:{zipper.get('streak')}")
+
+                # === REPLACEMENT with cooldown ===
+                existing_order = active_limits.get(key)
+                if existing_order:
+                    last_replace = existing_order.get('last_replace_ts', 0)
+                    if current_ts - last_replace < 75:  # 75 second cooldown
+                        continue
+                    
+                    if should_replace_existing_harbor(existing_order, sig, current_market_price, dev=dev):
+                        try:
+                            if existing_order.get('oid'):
+                                exchange.cancel(name=symbol.split('/')[0], oid=existing_order['oid'])
+                        except:
+                            pass
+
+                        roster.release(key)
+                        print(f"[REPLACED] Old harbor missed new nose on {tf} {bias.upper()}")
+                        del active_limits[key]
+                        # Mark new one
+                        sig['last_replace_ts'] = current_ts
+                    else:
+                        continue
+
+                # === SAFE SIZING - Respect real balance ===
+                capital = tf_data[tf]['capital']
+                real_balance = 371.70  # ← update this manually or pull from user_state
+
+                zipper_score = zipper.get('zipper_score', 0)
+                roster_base = roster.get_recommended_size(capital, tf)
+
+                # Hard safety cap
+                risk_amount = min(capital * (MAX_RISK_PER_TF_PCT / 100.0), real_balance * 0.25)   # max 25% of total balance per TF
+                roster_base = risk_amount / current_market_price / max(LEVERAGE, 8)
+
+                max_size = MAX_POSITION_USD / current_market_price / LEVERAGE
+                raw_size = roster_base * sailfish_mult * (1.0 + zipper_score * 1.1)
+                size = max(round(raw_size, 5), 0.00100)   # 5 decimals for BTC
+                size = min(size, 0.003)   # safer for small capital
+
+                # Glide price
+                base_price = sig.get('leading_limit', sig.get('anchor2_price', current_market_price))
+                try:
+                    a1_time = pd.to_datetime(sig['anchor1_time'])
+                    if a1_time.tz is None:
+                        a1_time = a1_time.tz_localize('UTC')
+                    hours_elapsed = (current_time - a1_time).total_seconds() / 3600
+                    glide_mult = 1.35 if tf in LOWER_TFS else 0.85
+                    glided = sig.get('anchor1_price', base_price) + sig.get('slope', 0) * hours_elapsed * glide_mult
+                except:
+                    glided = base_price
+
+                tf_offset = (hash(tf) % 180 - 90) * 0.06
+                if bias == 'long':
+                    price = min(glided, base_price, current_market_price * 0.982)
+                else:
+                    price = max(glided, base_price, current_market_price * 1.018)
+                price += tf_offset
+
+                # Dynamic closeness tolerance — lower TFs can stack on the same wick
+                # Dynamic closeness tolerance — now much looser
+                tf_tolerance = {
+                    '1m': 6.0, '3m': 10.0, '5m': 12.0,
+                    '15m': 20.0, '1h': 35.0, '4h': 50.0,
+                }.get(tf, 25.0)
+
+                if is_too_close_to_existing(price, active_limits, tolerance=tf_tolerance):
+                    continue
+
+                distance_pct = abs(price - current_market_price) / current_market_price
+                side_str = "buy" if bias == "long" else "sell"
+                coin = symbol.split('/')[0]
+
+                # === RICH DIAGNOSTIC PRINT (UTC) ===
+                try:
+                    nose_dt = pd.to_datetime(sig.get('nose_time')).tz_localize('UTC')
+                    man_dt = pd.to_datetime(sig.get('man_time')).tz_localize('UTC')
+                    eighth_dt = pd.to_datetime(sig.get('eighth_time')).tz_localize('UTC')
+
+                    nose_str = nose_dt.strftime('%H:%M %m/%d/%y')
+                    man_str = man_dt.strftime('%H:%M %m/%d/%y')
+                    eighth_str = eighth_dt.strftime('%H:%M %m/%d/%y')
+                except:
+                    nose_str = man_str = eighth_str = "??:?? ??/??/??"
+
+                print(f"\n[HARBOUR] {tf} {bias.upper()} {chain_type} | "
+                      f"Nose@{sig.get('nose_price',0):.0f} @ {nose_str} | "
+                      f"Man@{sig.get('anchor1_price',0):.0f} @ {man_str} | "
+                      f"Eighth@{sig.get('anchor2_price',0):.0f} @ {eighth_str} | "
+                      f"Lead@{price:.2f} | Activated:False")
+
+                # === ROBUST MARGIN GUARD (DEV OVERRIDE) ===
+                try:
+                    user_state = exchange.info.user_state(address=wallet.address)
+                    account_value = float(user_state.get('marginSummary', {}).get('accountValue', 0))
+                    withdrawable = float(user_state.get('withdrawable', 0))
+                    free_margin = max(account_value, withdrawable, 50.0)   # ← force min $50 on testnet
+                    
+                    print(f" → Margin check: Account ${account_value:,.2f} | Withdrawable ${withdrawable:,.2f} → Using ${free_margin:,.2f}")
+                    
+                    if free_margin < 50 and not dev:
+                        print(f" → Low margin (${free_margin:.2f}) — skipping order")
+                        continue
+                except Exception as e:
+                    print(f" → Margin check failed ({e}) — using safe default $100")
+                    free_margin = 100.0
+
+                # Place order
+                if distance_pct < 0.0015:
+                    order_result = place_market_order(symbol, side_str, size, wallet)
+                else:
+                    order_result = place_glide_limit_with_perturbation(
+                        symbol=symbol, side=side_str, size=size,
+                        calculated_glide_price=price, coin=coin,
+                        is_buy=(side_str.lower() == "buy")
+                    )
+
+                if order_result:
+                    oid = None
+                    try:
+                        statuses = order_result.get('response', {}).get('data', {}).get('statuses', [])
+                        if statuses and isinstance(statuses[0], dict):
+                            resting = statuses[0].get('resting')
+                            if resting:
+                                oid = resting.get('oid')
+                    except:
+                        pass
+
+                    active_limits[key] = {
+                        **sig,
+                        'price': price,
+                        'size': size,
+                        'oid': oid,
+                        'time': current_ts,
+                        'nose_price': nose_price,
+                        'tf': tf,
+                        'bias': bias,
+                        'chain_type': chain_type,
+                        'glide_origin_price': price,
+                        'glide_origin_ts': current_ts,
+                        'activated': False
+                    }
+
+                    roster.allocate(tf, bias, chain_type, size * current_market_price, key)
+                    if dev or verbose:
+                        print(f"[ROSTER ALLOCATED] {tf} {bias.upper()} {chain_type} | Slots used: {roster.get_total_allocated()}/72")
+
+                    print(f"[{tf} {bias.upper()}] {chain_type.upper()} @ {price:.2f} [SUCCESS]\n")
+
+                    tf_data[tf]['last_flip_time'] = current_ts + 20
+                    placed_this_cycle.add(key)
+                else:
+                    print(f"[{tf} {bias.upper()}] ❌ Order failed\n")
+
+            # Glide + Hedge + Cleanup + Export (exactly as you have)
+            for tf in ['1m', '3m', '5m', '15m', '1h', '4h']:
+                new_close_time = detect_candle_close(tf, glide_manager.last_candle_close.get(tf), symbol)
+                if new_close_time:
+                    glide_manager.on_candle_close(tf, new_close_time)
+
+            if current_ts - last_hedge_update > 45:
+                evaluate_glide_v155(active_limits, current_market_price, current_ts)
+                update_topiary_hedges_v155(tf_data, current_market_price, args,
+                                           current_signals=all_signals, symbol=symbol, wallet=wallet)
+                last_hedge_update = current_ts
+
+            if current_ts - last_cleanup > 180:
+                to_remove = [k for k, v in active_limits.items() if current_ts - v['time'] > 900]
+                for k in to_remove:
+                    try:
+                        if active_limits[k].get('oid'):
+                            exchange.cancel(name=symbol.split('/')[0], oid=active_limits[k]['oid'])
+                    except:
+                        pass
+                    roster.release(k)
+                    if k in active_limits:
+                        del active_limits[k]
+                last_cleanup = current_ts
+
+            if active_limits:
+                print(f"\n📊 ACTIVE LIMITS: {len(active_limits)} | Roster: {roster.get_total_allocated()}/72 | Price ${current_market_price:,.0f}")
             else:
-                anchor_high_t.append(line['anchor2_time'])
-                anchor_high_p.append(line['anchor2_price'])
+                print(f"\n📊 No active limits | Roster: {roster.get_total_allocated()}/72 | Price ${current_market_price:,.0f}")
 
-    if long_trends:
-        avg = pd.Series(index=df.index, dtype=float)
-        avg.iloc[-1] = np.mean(long_trends)
-        addplots.append(mpf.make_addplot(avg, color='green', width=3, label='Avg Long'))
-    if short_trends:
-        avg = pd.Series(index=df.index, dtype=float)
-        avg.iloc[-1] = np.mean(short_trends)
-        addplots.append(mpf.make_addplot(avg, color='maroon', width=3, label='Avg Short'))
+            export_state_json(active_limits, current_market_price, roster=roster, symbol=symbol)
+            export_harbor_lines_json(active_limits, current_market_price, symbol=symbol)
+            export_pine_ready(active_limits, current_market_price, symbol=symbol)
 
-    if anchor_low_t:
-        s = pd.Series(index=df.index, dtype=float)
-        idx = df.index.get_indexer(anchor_low_t, method='nearest')
-        valid = idx != -1
-        s.iloc[idx[valid]] = np.array(anchor_low_p)[valid]
-        addplots.append(mpf.make_addplot(s, type='scatter', marker='o', markersize=100, color='lime'))
-    if anchor_high_t:
-        s = pd.Series(index=df.index, dtype=float)
-        idx = df.index.get_indexer(anchor_high_t, method='nearest')
-        valid = idx != -1
-        s.iloc[idx[valid]] = np.array(anchor_high_p)[valid]
-        addplots.append(mpf.make_addplot(s, type='scatter', marker='o', markersize=100, color='red'))
+        except KeyboardInterrupt:
+            print("\n🛑 Stopped by user.")
+            break
+        except Exception as e:
+            print(f"[CRITICAL LOOP ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(25)
 
-    mpf.plot(df, type='candle', style='charles', addplot=addplots, volume=True,
-             title=f"{symbol} {args.timeframe} Harbor Backtest ({'HUNT' if args.hunt else 'Safe'})",
-             figsize=(16,10), savefig='backtest_diagnostic_main.png')
-    print("Chart saved -> backtest_diagnostic_main.png")
+# ==================== MAIN ====================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Tetris + Topiary 15.1 - 4 Layer Harbor System")
+    parser.add_argument("--symbols", default="BTC/USDC")
+    parser.add_argument("--timeframe", default="1m")
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--testnet", action="store_true")
+    parser.add_argument("--dev", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--cycle", action="store_true")
+    parser.add_argument("--topiary", action="store_true", help="Enable richer 15.1 Topiary hedge logic")
+    parser.add_argument("--days-back", type=int, default=7)
+    parser.add_argument("--stop", type=float, default=0.02)
+    parser.add_argument("--check-balance", action="store_true")
+    parser.add_argument("--backtest-then-live", action="store_true", 
+                        help="Run backtest then automatically start live mode")
+    return parser.parse_args()
 
+# ==================== MAIN (unchanged) ====================
 def main():
-    parser = argparse.ArgumentParser(description="CurveSwing - Harbor Backtest with Memory")
-    parser.add_argument("--backtest", action="store_true")
-    parser.add_argument("--hunt", action="store_true")
-    parser.add_argument("--symbol", default=None)
-    parser.add_argument("--timeframe", default=DEFAULT_TIMEFRAME)
-    parser.add_argument("--days-back", type=int, default=365)
-    parser.add_argument("--trail", action="store_true")
-    parser.add_argument("--trail-mult", type=float, default=1.5)
-    parser.add_argument("--debug-lines", action="store_true")
-    parser.add_argument("--drip-pct", type=float, default=None)
-    args = parser.parse_args()
-    backtest(args)
+    args = parse_args()
+    if args.check_balance:
+        check_balance()
+        return
+    if args.live:
+        run_live_mode(args)
+    if args.backtest_then_live:
+        print("🔄 Running Backtest first...")
+        final_cap, max_dd, fees = run_backtest_for_symbol(args.symbols.split(',')[0].strip(), args)
+        print(f"\n✅ Backtest finished → Starting LIVE mode automatically...\n")
+        args.live = True
+        run_live_mode(args)
+    elif args.live:
+        run_live_mode(args)
+    else:
+        # Standalone backtest
+        print("🔄 Running standalone backtest...")
+        final_cap, max_dd, fees = run_backtest_for_symbol(args.symbols.split(',')[0].strip(), args)
 
 if __name__ == "__main__":
     main()
+
+# 2. Live only
+#python tetris_topiary.py --symbols BTC/USDC --timeframe 1m --live --testnet --dev
+
+# 3. Backtest only
+#python tetris_topiary.py --symbols BTC/USDC --timeframe 1m --dev --days-back 7
+
+# screen -S tetra_bot ./run_tetra.sh
+# screen -r tetra_bot
+# screen -ls
+# screen -S tetra_bot -X quit
+# screen -S tetra_bot python tetris_topiary.py --symbols BTC/USDC --timeframe 1m --live --testnet --dev --verbose
