@@ -21,15 +21,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Tetris + Topiary v14.78 - FINAL CONSOLIDATED VERSION
-- Exactly 18 live limit orders (9 long + 9 short)
-- Most recent unstruck harbor line per TF per direction
-- Reversal limits only after eighth_idx + activation_offset
-- Dynamic 10% risk per TF sizing
-- Candle-timed resets
-- Full Topiary hedging + nose stops
-- Isolated margin + state export
-- Complete get_reecent_harbor_signals (15.1 logic)
+Tetris + Topiary v15.9.5 - 10× + 0.01 BTC + REVERSALS + ACT+1
+- Full 72 live limit orders (8 per TF: pico/nano/micro/macro × long/short)
+- Leverage default 10×, target order size 0.01 BTC
+- Nearest-order hit → full reversal; further same-side hits → add size
+- Activation offset +1 swing (all chains) — affordance pushed one swing right
+- ACCOUNT_ADDRESS / BALANCE_OVERRIDE for agent vs master balance
+- Kill-switch on nose-stop (−2 %) + session DD; soft per-chain cap 3
+- Glide + Topiary + roster + Pine export
 """
 
 import argparse
@@ -58,13 +57,14 @@ LEAD_FACTOR = 0.20
 DEFAULT_FEES = 0.045
 DEFAULT_MIN_DELTA_PCT = 0.20
 STOP_BUFFER = 0.0002
-MAX_POSITION_USD = 12_000
-MAX_TF_EXPOSURE_USD = 3000
+MAX_POSITION_USD = 25_000
+MAX_TF_EXPOSURE_USD = 6000
 MAX_MARTINGALE_ROUNDS = 10
 CYCLE_PCT = 0.30
-LEVERAGE = int(os.getenv("LEVERAGE", 10))
+LEVERAGE = int(os.getenv("LEVERAGE", 10))          # v15.9.5: default 10×
+TARGET_ORDER_SIZE_BTC = float(os.getenv("ORDER_SIZE_BTC", "0.01"))  # target 0.01 BTC
 LOWER_TFS = ['1m', '3m', '5m']
-HIGHER_TFS = ['15m', '1h', '4h', '1d', '1w', '1M']   # ← 1w and 1M are already here
+HIGHER_TFS = ['15m', '1h', '4h', '1d', '1w', '1M']
 ALL_TFS = LOWER_TFS + HIGHER_TFS
 STATE_EXPORT_INTERVAL = 300
 TF_RESET_INTERVAL = {
@@ -72,29 +72,36 @@ TF_RESET_INTERVAL = {
     '1h': 3600, '4h': 14400, '1d': 86400
 }
 
-# ====================== PICO (Short-term, reactive) ======================
+# ==================== v15.9.5 RISK CONTROLS ====================
+NOSE_STOP_PCT = 0.02                    # −2 % nose stop
+KILL_SWITCH_COOLDOWN_SEC = 900          # 15 min pause after any nose-stop
+MAX_OPEN_PER_CHAIN = 3                  # soft global cap per chain type
+MIN_HOTSPOT_MICRO_MACRO = 1.0           # micro/macro need hotspot ≥ 1
+SESSION_MAX_DD_PCT = 8.0                # hard session DD circuit (extra safety)
+
+# ====================== PICO (Short-term, reactive) — ACT +1 ======================
 MAN_OFFSET_PICO      = 2
 EIGHTH_OFFSET_PICO   = 3
 MIN_CHAIN_PICO       = 3
-ACTIVATION_OFFSET_PICO = 8
+ACTIVATION_OFFSET_PICO = 9              # was 8 → +1 swing right
 
-# ====================== NANO (Ultra-short, high-frequency) ======================
+# ====================== NANO (Ultra-short) — ACT +1 ======================
 MAN_OFFSET_NANO      = 8
 EIGHTH_OFFSET_NANO   = 11
 MIN_CHAIN_NANO       = 16
-ACTIVATION_OFFSET_NANO = 5
+ACTIVATION_OFFSET_NANO = 6              # was 5 → +1
 
-# ====================== MICRO (Full-chains, high-frequency) ======================
+# ====================== MICRO — ACT +1 ======================
 MAN_OFFSET_MICRO     = 9
 EIGHTH_OFFSET_MICRO  = 17
 MIN_CHAIN_MICRO      = 22
-ACTIVATION_OFFSET_MICRO = 4
+ACTIVATION_OFFSET_MICRO = 5             # was 4 → +1
 
-# ====================== MACRO (Long-chains, low-frequency) ======================
+# ====================== MACRO — ACT +1 ======================
 MAN_OFFSET_MACRO     = 21
 EIGHTH_OFFSET_MACRO  = 35
 MIN_CHAIN_MACRO      = 44
-ACTIVATION_OFFSET_MACRO = 9
+ACTIVATION_OFFSET_MACRO = 10            # was 9 → +1
 
 GLIDE_MIN_STEP_USD = 6.0
 # ==================== v15.6 GLIDE EXECUTION (Candle-Driven) ====================
@@ -267,34 +274,60 @@ class AffordanceRoster:
         return max(0.005, round(size, 4))
 
 # ==================== HYPERLIQUID SDK ====================
-def get_hyperliquid_exchange(wallet, testnet=False):   # Default to MAINNET
+def get_account_address(wallet):
+    """
+    Master account that holds funds.
+    - If PRIVATE_KEY is an API/agent wallet, set ACCOUNT_ADDRESS (or MASTER_ADDRESS)
+      in .env to the funded main wallet address.
+    - Otherwise defaults to the signing wallet address.
+    """
+    master = (os.getenv('ACCOUNT_ADDRESS') or os.getenv('MASTER_ADDRESS') or '').strip()
+    if master:
+        return master
+    return wallet.address
+
+
+def get_hyperliquid_exchange(wallet, testnet=False, account_address=None):
     from hyperliquid.exchange import Exchange
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
-    
+
     url = constants.TESTNET_API_URL if testnet else constants.MAINNET_API_URL
-    exchange = Exchange(wallet, url)
+    if account_address is None:
+        account_address = get_account_address(wallet)
+
+    # When agent ≠ master, pass account_address so orders/margin hit the funded account
+    if account_address.lower() != wallet.address.lower():
+        exchange = Exchange(wallet, url, account_address=account_address)
+        print(f"🔗 Connected to {'TESTNET' if testnet else 'MAINNET'} | agent {wallet.address[:10]}… → account {account_address[:10]}…")
+    else:
+        exchange = Exchange(wallet, url)
+        print(f"🔗 Connected to {'TESTNET' if testnet else 'MAINNET'} | account {wallet.address[:10]}…")
+
     exchange.info = Info(url, skip_ws=True)
-    
-    print(f"🔗 Connected to {'TESTNET' if testnet else 'MAINNET'}")
+    exchange._account_address = account_address   # stash for callers
     return exchange
 
-def setup_isolated_margin(coin: str, testnet=True):
+
+def setup_isolated_margin(coin: str, testnet=False, wallet=None, account_address=None):
     try:
-        # Use a dummy wallet or skip signing if possible, but simplest:
-        private_key = os.getenv('PRIVATE_KEY')
-        wallet = Account.from_key(private_key)
-        exchange = get_hyperliquid_exchange(wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
+        if wallet is None:
+            wallet = Account.from_key(os.getenv('PRIVATE_KEY'))
+        if account_address is None:
+            account_address = get_account_address(wallet)
+        exchange = get_hyperliquid_exchange(wallet, testnet=testnet, account_address=account_address)
         exchange.update_leverage(name=coin, leverage=LEVERAGE, is_cross=False)
         print(f"[ISOLATED] {coin} set to ISOLATED margin @ {LEVERAGE}x")
     except Exception as e:
         print(f"[ISOLATED WARNING] {e} (this is usually harmless on testnet)")
 
-def place_glide_limit_with_perturbation(symbol, side, size, calculated_glide_price, coin, is_buy=True, max_attempts=6, wallet=None, testnet=False):
+def place_glide_limit_with_perturbation(symbol, side, size, calculated_glide_price, coin, is_buy=True, max_attempts=6, wallet=None, testnet=False, account_address=None):
     if wallet is None:
         wallet = Account.from_key(os.getenv('PRIVATE_KEY'))
+    if account_address is None:
+        account_address = get_account_address(wallet)
 
-    exchange = get_hyperliquid_exchange(wallet, testnet=testnet)
+    exchange = get_hyperliquid_exchange(wallet, testnet=testnet, account_address=account_address)
     is_buy = side.lower() == 'buy'
 
     if coin.upper() == "BTC":
@@ -378,10 +411,12 @@ def update_or_create_limit(active_limits, key, limit_price, size, current_time, 
     
     return active_limits[key]
 
-def sync_filled_positions(tf_data, symbol, wallet, testnet=False):
+def sync_filled_positions(tf_data, symbol, wallet, testnet=False, account_address=None):
     try:
-        exchange = get_hyperliquid_exchange(wallet, testnet=testnet)
-        user_state = exchange.info.user_state(address=wallet.address)
+        if account_address is None:
+            account_address = get_account_address(wallet)
+        exchange = get_hyperliquid_exchange(wallet, testnet=testnet, account_address=account_address)
+        user_state = exchange.info.user_state(address=account_address)
         coin = symbol.split('/')[0]
         
         real_pos = None
@@ -402,16 +437,167 @@ def sync_filled_positions(tf_data, symbol, wallet, testnet=False):
     except Exception as e:
         print(f"[SYNC ERROR] {e}")
 
-def place_market_order(symbol: str, side: str, size: float, wallet=None):
+
+def fetch_account_equity(exchange, account_address, balance_override=None):
+    """
+    Best-effort equity from perps + spot. Returns (equity, detail_dict).
+    """
+    detail = {'perps_av': 0.0, 'perps_wd': 0.0, 'spot_usdc': 0.0}
+    try:
+        us = exchange.info.user_state(address=account_address)
+        detail['perps_av'] = float(us.get('marginSummary', {}).get('accountValue', 0) or 0)
+        detail['perps_wd'] = float(us.get('withdrawable', 0) or 0)
+    except Exception as e:
+        detail['perps_err'] = str(e)
+    try:
+        spot = exchange.info.spot_user_state(address=account_address)
+        for b in spot.get('balances', []) or []:
+            coin = (b.get('coin') or b.get('token') or '').upper()
+            if coin in ('USDC', 'USDC.E', 'USDT'):
+                detail['spot_usdc'] += float(b.get('total', b.get('available', 0)) or 0)
+    except Exception as e:
+        detail['spot_err'] = str(e)
+
+    equity = max(detail['perps_av'], detail['perps_wd'], detail['spot_usdc'])
+    if equity < 1.0 and balance_override:
+        equity = float(balance_override)
+        detail['override'] = float(balance_override)
+    return equity, detail
+
+
+def process_limit_fills_and_reversals(active_limits, tf_data, current_price, symbol, wallet,
+                                     testnet=False, account_address=None, order_size=None):
+    """
+    v15.9.5 reversal / add-on rules:
+    - When the nearest resting limit is crossed → full reversal of current position.
+    - Further limits in the same direction as the new bias (price continues through them)
+      → allowed to increase (add) position size.
+    Detects fills by price cross vs resting limit prices; removes filled keys from active_limits.
+    """
+    if order_size is None:
+        order_size = TARGET_ORDER_SIZE_BTC
+    if account_address is None:
+        account_address = get_account_address(wallet)
+
+    # Gather crossed limits this tick
+    crossed = []  # (key, lim, dist)
+    for key, lim in list(active_limits.items()):
+        if not isinstance(lim, dict):
+            continue
+        px = float(lim.get('price', 0) or 0)
+        if px <= 0:
+            continue
+        bias = lim.get('bias', 'long')
+        # long limit fills when market trades at/below limit; short at/above
+        if bias == 'long' and current_price <= px * 1.0005:
+            crossed.append((key, lim, abs(current_price - px)))
+        elif bias == 'short' and current_price >= px * 0.9995:
+            crossed.append((key, lim, abs(current_price - px)))
+
+    if not crossed:
+        return
+
+    # Nearest crossed order drives the decision
+    crossed.sort(key=lambda x: x[2])
+    nearest_key, nearest_lim, _ = crossed[0]
+    new_bias = nearest_lim.get('bias', 'long')
+    tf = nearest_lim.get('tf', nearest_key.split('_')[0])
+    fill_size = float(nearest_lim.get('size') or order_size)
+
+    # Current book position (shared across TFs from sync)
+    pos = None
+    for d in tf_data.values():
+        if d.get('position'):
+            pos = d['position']
+            break
+
+    old_side = pos[0] if pos and len(pos) >= 3 else None
+    old_size = float(pos[2]) if pos and len(pos) >= 3 else 0.0
+    old_entry = float(pos[1]) if pos and len(pos) >= 3 else 0.0
+
+    # --- REVERSE: nearest fill is opposite to current position ---
+    if old_side and old_side != new_bias:
+        close_side = 'sell' if old_side == 'long' else 'buy'
+        print(f"[REVERSE] Nearest fill {tf} {new_bias.upper()} @ {nearest_lim.get('price'):.2f} "
+              f"→ close {old_side.upper()} {old_size:.4f} then open {new_bias.upper()} {fill_size:.4f}")
+        place_market_order(symbol, close_side, old_size, wallet=wallet, testnet=testnet,
+                           reduce_only=True, account_address=account_address)
+        open_side = 'buy' if new_bias == 'long' else 'sell'
+        place_market_order(symbol, open_side, fill_size, wallet=wallet, testnet=testnet,
+                           reduce_only=False, account_address=account_address)
+        new_pos = (new_bias, current_price, fill_size)
+        for d in tf_data.values():
+            d['position'] = new_pos
+            d['stop_loss_level'] = (current_price * (1 - NOSE_STOP_PCT) if new_bias == 'long'
+                                    else current_price * (1 + NOSE_STOP_PCT))
+            d['last_flip_time'] = time.time()
+
+    # --- ADD: same direction (or flat) and further same-side fills ---
+    elif not old_side or old_side == new_bias:
+        # Count how many same-bias limits were crossed (adds)
+        same_side = [(k, lim) for k, lim, _ in crossed if lim.get('bias') == new_bias]
+        add_lots = len(same_side)
+        add_size = fill_size * max(1, add_lots) if not old_side else fill_size * max(0, add_lots)
+        # If flat, open with first lot; if already same side, only add the extra crosses
+        if not old_side:
+            open_side = 'buy' if new_bias == 'long' else 'sell'
+            print(f"[OPEN] Nearest fill {tf} {new_bias.upper()} @ {nearest_lim.get('price'):.2f} "
+                  f"→ open {fill_size:.4f} (+{max(0, add_lots-1)} add-on lots)")
+            place_market_order(symbol, open_side, fill_size * add_lots, wallet=wallet, testnet=testnet,
+                               reduce_only=False, account_address=account_address)
+            new_pos = (new_bias, current_price, fill_size * add_lots)
+            for d in tf_data.values():
+                d['position'] = new_pos
+                d['stop_loss_level'] = (current_price * (1 - NOSE_STOP_PCT) if new_bias == 'long'
+                                        else current_price * (1 + NOSE_STOP_PCT))
+                d['last_flip_time'] = time.time()
+        else:
+            # already same side — only increase on further hits beyond nearest
+            further = [x for x in same_side if x[0] != nearest_key]
+            if further:
+                extra = fill_size * len(further)
+                open_side = 'buy' if new_bias == 'long' else 'sell'
+                print(f"[ADD] Price continued through {len(further)} further {new_bias.upper()} limit(s) "
+                      f"→ add {extra:.4f}")
+                place_market_order(symbol, open_side, extra, wallet=wallet, testnet=testnet,
+                                   reduce_only=False, account_address=account_address)
+                new_size = old_size + extra
+                # volume-weighted entry approx
+                new_entry = ((old_entry * old_size) + (current_price * extra)) / max(new_size, 1e-9)
+                new_pos = (new_bias, new_entry, new_size)
+                for d in tf_data.values():
+                    d['position'] = new_pos
+                    d['last_flip_time'] = time.time()
+
+    # Remove all crossed limits from active book + cancel residual oids if any
+    for key, lim, _ in crossed:
+        try:
+            if lim.get('oid'):
+                ex = get_hyperliquid_exchange(wallet, testnet=testnet, account_address=account_address)
+                ex.cancel(name=symbol.split('/')[0], oid=lim['oid'])
+        except Exception:
+            pass
+        if key in active_limits:
+            del active_limits[key]
+        # roster release best-effort
+        try:
+            pass  # roster release handled by caller if needed
+        except Exception:
+            pass
+
+
+def place_market_order(symbol: str, side: str, size: float, wallet=None, testnet=False, reduce_only=False, account_address=None):
     """Aggressive market order with None guard"""
     try:
         if wallet is None:
             wallet = Account.from_key(os.getenv('PRIVATE_KEY'))
+        if account_address is None:
+            account_address = get_account_address(wallet)
         if size is None or size <= 0:
             print(f"[MARKET SKIP] Invalid size: {size}")
             return None
 
-        exchange = get_hyperliquid_exchange(wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
+        exchange = get_hyperliquid_exchange(wallet, testnet=testnet, account_address=account_address)
         coin = symbol.split('/')[0]
         is_buy = side.lower() == 'buy'
 
@@ -423,7 +609,7 @@ def place_market_order(symbol: str, side: str, size: float, wallet=None):
             sz=round(size, 4),
             limit_px=None,
             order_type={"limit": {"tif": "Ioc"}},
-            reduce_only=False
+            reduce_only=reduce_only
         )
         print(f"[MARKET SUCCESS] {side.upper()} {size:.4f} filled")
         return order
@@ -466,7 +652,7 @@ class TopiaryHedge:
     def taper(self, current_price, reason="MANUAL"):
         if not self.active:
             return 0.0
-        notional = min(self.size * current_price * min(LEVERAGE, 15), 8000)
+        notional = min(self.size * current_price * min(LEVERAGE, 40), 12000)
         returned = notional * 0.28
         self.tapered_value = returned
         self.active = False
@@ -1135,15 +1321,7 @@ def get_zipper_state(tf_data, tf):
     }
 
 def is_too_close_to_existing(new_price: float, active_limits: dict, tolerance: float = 8.0) -> bool:
-    """Lifted guard — allows full 72-slot roster. Only blocks near-duplicates."""
-    if tolerance >= 50.0:  # High tolerance = effectively disabled for stacking
-        return False
-    
-    for key, order in active_limits.items():
-        existing = order.get('price', 0)
-        if abs(new_price - existing) < tolerance:
-            print(f"   → Skipped: too close to existing {key} @ {existing:.2f} (tol={tolerance})")
-            return True
+    """v15.9.3: FULLY DISABLED — every chain/bias gets its own roster slot (72 total)."""
     return False
 
 def detect_sailfish_strength(sig, df=None):
@@ -1224,22 +1402,23 @@ def should_place_reversal(sig):
 
 def passes_activation_gate(eighth_idx, swings_after, chain_type):
     """
-    Relaxed fractal activation gate for live/testnet
-    - pico/nano activate very quickly (almost immediate)
-    - micro/macro wait for 1–2 extra confirmations
+    Activation gate — v15.9.5: +1 swing on every chain (push affordance right).
+    - pico: was 0 → now 1
+    - nano: was 1 → now 2
+    - micro: was 2 → now 3
+    - macro: was 3 → now 4
     """
     if not swings_after:
         return False
 
-    # Count how many swings happened AFTER the eighth swing
     extra_swings = sum(1 for idx in swings_after if idx > eighth_idx)
 
     min_required = {
-        'pico': 0,      # pico can fire instantly
-        'nano': 1,
-        'micro': 2,
-        'macro': 3
-    }.get(chain_type, 1)
+        'pico': 1,      # +1 from 0
+        'nano': 2,      # +1 from 1
+        'micro': 3,     # +1 from 2
+        'macro': 4,     # +1 from 3
+    }.get(chain_type, 2)
 
     return extra_swings >= min_required
     
@@ -1962,7 +2141,7 @@ def run_live_mode(args):
     import os
     import pandas as pd
 
-    print("🚀 Starting LIVE MODE v15.9.2 — Layover + Relaxed Activation")
+    print("🚀 Starting LIVE MODE v15.9.5 — 10× · 0.01 BTC · Reversals · ACT+1")
 
     symbol = args.symbols.split(',')[0].strip()
     verbose = getattr(args, 'verbose', False)
@@ -1973,22 +2152,37 @@ def run_live_mode(args):
         raise ValueError("PRIVATE_KEY environment variable not set!")
 
     wallet = Account.from_key(private_key)
-        # One-time isolated margin setup
-    setup_isolated_margin("BTC", testnet=args.testnet if hasattr(args, 'testnet') else False)
-    print(f"✅ Wallet: {wallet.address}")
+    account_address = get_account_address(wallet)
+    is_testnet = bool(getattr(args, 'testnet', False))
+
+    # Optional explicit override (e.g. BALANCE_OVERRIDE=435.23)
+    balance_override = os.getenv('BALANCE_OVERRIDE')
+    balance_override = float(balance_override) if balance_override else None
+
+    # One-time isolated margin setup (on the funded account)
+    setup_isolated_margin("BTC", testnet=is_testnet, wallet=wallet, account_address=account_address)
+    print(f"✅ Signer (agent/key): {wallet.address}")
+    print(f"✅ Account (funds)   : {account_address}")
+    if wallet.address.lower() != account_address.lower():
+        print("   → Agent mode: signing with API wallet, balances/orders on master account")
 
     LOWER_TFS = ['1m', '3m', '5m', '15m']
     HIGHER_TFS = ['1h', '4h', '1d', '1w']
 
     try:
-        exchange = get_hyperliquid_exchange(wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
-        user_state = exchange.info.user_state(address=wallet.address)
-        account_value = float(user_state.get('marginSummary', {}).get('accountValue', 0))
-        withdrawable = float(user_state.get('withdrawable', 0))
-        total_balance = max(account_value, withdrawable, 371.70)
-        print(f"✅ Balance: ${total_balance:,.2f} USDC (Account: ${account_value:,.2f} | Withdrawable: ${withdrawable:,.2f})")
+        exchange = get_hyperliquid_exchange(wallet, testnet=is_testnet, account_address=account_address)
+        total_balance, bal_detail = fetch_account_equity(exchange, account_address, balance_override)
+        if total_balance < 1.0:
+            total_balance = balance_override or 435.23
+            print(f"[BALANCE] API near $0 on {account_address[:12]}… — using ${total_balance:,.2f}")
+            print(f"   Detail: perps_av={bal_detail.get('perps_av')} wd={bal_detail.get('perps_wd')} spot={bal_detail.get('spot_usdc')}")
+            print("   Tip: set ACCOUNT_ADDRESS=<funded master> and/or BALANCE_OVERRIDE=435.23 in .env")
+        else:
+            print(f"✅ Balance: ${total_balance:,.2f} USDC "
+                  f"(perps ${bal_detail.get('perps_av',0):,.2f} | wd ${bal_detail.get('perps_wd',0):,.2f} | "
+                  f"spot ${bal_detail.get('spot_usdc',0):,.2f})")
     except Exception as e:
-        total_balance = 371.70
+        total_balance = balance_override or 435.23
         print(f"[BALANCE] Using fallback ${total_balance:,.2f} | Error: {e}")
 
     # === INITIALISE CORE OBJECTS FIRST ===
@@ -2006,34 +2200,68 @@ def run_live_mode(args):
             'last_flip_time': 0.0,
             'recent_structures': [],
             'tapered_profit': 0.0,
+            'total_fees': 0.0,
+            'stop_loss_level': None,
         }
 
-    # === LIVE STARTUP — LOAD LAYOVER (ONE TIME ONLY) ===
+    # v15.9.4 session risk state
+    session_peak_equity = total_balance
+    session_fees = 0.0
+    kill_switch_until = 0.0          # unix ts — no new harbors until this time
+    nose_stops_this_session = 0
+    equity_valid_cycles = 0          # don't arm DD kill-switch until we have real readings
+
+    # === LIVE STARTUP — LOAD LAYOVER (smart filter) ===
     print("[LIVE] Checking for backtest layover...")
     layover_signals = load_harbor_layover_for_live(dev=dev)
 
-    current_market_price = 80000.0  # safe fallback until first mids fetch
+    # Fetch a real mid ASAP so we can filter stale layover lines
+    try:
+        mids0 = exchange.info.all_mids()
+        current_market_price = float(mids0.get(symbol.split('/')[0], 64000.0))
+    except Exception:
+        current_market_price = 64000.0
+
+    LAYOVER_MAX_DIST_PCT = 0.06      # only keep signals within ±6% of market
+    LAYOVER_MAX_SEED = 18            # hard cap on seeded lines
     if layover_signals:
-        for sig in layover_signals:
+        seeded = 0
+        for sig in sorted(layover_signals,
+                          key=lambda s: abs(float(s.get('leading_limit', 0)) - current_market_price)):
+            if seeded >= LAYOVER_MAX_SEED:
+                break
+            lead = float(sig.get('leading_limit', 0) or 0)
+            if lead <= 0:
+                continue
+            dist = abs(lead - current_market_price) / current_market_price
+            if dist > LAYOVER_MAX_DIST_PCT:
+                continue
             tf = sig['timeframe']
             bias = sig['bias']
-            key = f"{tf}_{bias}"
+            chain_type = sig.get('chain_type', 'pico')
+            key = f"{tf}_{bias}_{chain_type}"
+            if key in active_limits:
+                continue
             active_limits[key] = {
                 **sig,
-                'price': sig['leading_limit'],
-                'size': 0.01,
-                'oid': None,
+                'price': lead,
+                'size': 0.001,          # tiny placeholder — real size on live place
+                'oid': None,            # not yet on exchange
                 'time': time.time(),
                 'tf': tf,
                 'bias': bias,
-                'chain_type': sig.get('chain_type', 'pico'),
-                'glide_origin_price': sig['leading_limit'],
+                'chain_type': chain_type,
+                'glide_origin_price': lead,
                 'glide_origin_ts': time.time(),
-                'activated': False
+                'activated': False,
+                'from_layover': True,
             }
-            roster.allocate(tf, bias, sig.get('chain_type', 'pico'),
-                           0.01 * current_market_price, key)
-        print(f"[LIVE] ✅ Seeded {len(layover_signals)} Harbor lines from backtest layover")
+            roster.allocate(tf, bias, chain_type, 0.001 * current_market_price, key)
+            seeded += 1
+        print(f"[LIVE] ✅ Seeded {seeded}/{len(layover_signals)} nearby layover lines "
+              f"(≤{LAYOVER_MAX_DIST_PCT*100:.0f}% of ${current_market_price:,.0f})")
+        if seeded == 0:
+            print("[LIVE] All layover signals too far from market — starting clean")
     else:
         print("[LIVE] No layover — starting clean")
 
@@ -2042,10 +2270,10 @@ def run_live_mode(args):
     glide_manager = GlideExecutionManager(
         active_limits_ref=active_limits, 
         wallet=wallet,
-        testnet=args.testnet if hasattr(args, 'testnet') else False
+        testnet=is_testnet
     )
 
-    sync_filled_positions(tf_data, symbol, wallet, testnet=args.testnet if hasattr(args, 'testnet') else False)
+    sync_filled_positions(tf_data, symbol, wallet, testnet=is_testnet, account_address=account_address)
 
     while True:
         try:
@@ -2054,7 +2282,81 @@ def run_live_mode(args):
             mids = exchange.info.all_mids()
             current_market_price = float(mids.get(symbol.split('/')[0], 80000.0))
 
-            sync_filled_positions(tf_data, symbol, wallet)
+            sync_filled_positions(tf_data, symbol, wallet, testnet=is_testnet, account_address=account_address)
+
+            # ─── REVERSALS / ADD-ONS on limit fills (v15.9.5) ───
+            try:
+                process_limit_fills_and_reversals(
+                    active_limits, tf_data, current_market_price, symbol, wallet,
+                    testnet=is_testnet, account_address=account_address,
+                    order_size=TARGET_ORDER_SIZE_BTC
+                )
+            except Exception as e:
+                print(f"[REVERSE/ADD ERROR] {e}")
+
+            # ─── LIVE EQUITY + KILL-SWITCH / NOSE-STOP MONITOR ───
+            try:
+                live_equity, _bd = fetch_account_equity(exchange, account_address, balance_override)
+                if live_equity < 1.0:
+                    live_equity = total_balance
+                else:
+                    total_balance = live_equity
+                    equity_valid_cycles += 1
+            except Exception:
+                live_equity = total_balance
+
+            session_peak_equity = max(session_peak_equity, live_equity)
+            session_dd_pct = (session_peak_equity - live_equity) / session_peak_equity * 100 if session_peak_equity > 0 else 0.0
+
+            # Hard session DD circuit — only after ≥3 valid readings AND equity is meaningful
+            if (equity_valid_cycles >= 3 and live_equity >= 50.0
+                    and session_dd_pct >= SESSION_MAX_DD_PCT
+                    and current_ts > kill_switch_until):
+                kill_switch_until = current_ts + KILL_SWITCH_COOLDOWN_SEC
+                print(f"[KILL-SWITCH] Session DD {session_dd_pct:.1f}% ≥ {SESSION_MAX_DD_PCT}% → pause new harbors for {KILL_SWITCH_COOLDOWN_SEC//60} min")
+
+            # Per-position nose-stop (−2 %)
+            for tf, d in list(tf_data.items()):
+                pos = d.get('position')
+                if not pos:
+                    continue
+                if len(pos) >= 3:
+                    side, entry, size = pos[0], pos[1], pos[2]
+                else:
+                    continue
+                # Ensure a stop level exists (set on first sight of the position)
+                if d.get('stop_loss_level') is None:
+                    if side == 'long':
+                        d['stop_loss_level'] = entry * (1.0 - NOSE_STOP_PCT)
+                    else:
+                        d['stop_loss_level'] = entry * (1.0 + NOSE_STOP_PCT)
+                sl = d['stop_loss_level']
+                hit = (side == 'long' and current_market_price <= sl) or \
+                      (side == 'short' and current_market_price >= sl)
+                if hit:
+                    # Close via market (reduce-only style)
+                    close_side = 'sell' if side == 'long' else 'buy'
+                    print(f"[NOSE STOP] {tf} {side.upper()} hit −{NOSE_STOP_PCT*100:.0f}% @ {current_market_price:.2f} (entry {entry:.2f})")
+                    place_market_order(symbol, close_side, size, wallet, testnet=is_testnet, reduce_only=True, account_address=account_address)
+                    # Realised loss estimate
+                    pnl = (current_market_price - entry) * size * LEVERAGE if side == 'long' else (entry - current_market_price) * size * LEVERAGE
+                    fee_est = abs(pnl) * DEFAULT_FEES / 100
+                    d['capital'] += pnl - fee_est
+                    d['total_fees'] = d.get('total_fees', 0.0) + fee_est
+                    session_fees += fee_est
+                    nose_stops_this_session += 1
+                    # Clear position + related topiary hedges for this TF
+                    d['position'] = None
+                    d['stop_loss_level'] = None
+                    if d.get('hedges'):
+                        for h in d['hedges']:
+                            if h.active:
+                                h.active = False
+                        print(f"[NOSE STOP] Cleared {len(d['hedges'])} Topiary hedges on {tf}")
+                        d['hedges'] = []
+                    # Arm kill-switch
+                    kill_switch_until = max(kill_switch_until, current_ts + KILL_SWITCH_COOLDOWN_SEC)
+                    print(f"[KILL-SWITCH] Nose-stop → new harbor entries paused until {datetime.fromtimestamp(kill_switch_until, tz=timezone.utc).strftime('%H:%M:%S')} UTC")
 
             # === SIGNAL GATHERING ===
             all_signals = []
@@ -2071,7 +2373,7 @@ def run_live_mode(args):
                     tf_signals = get_recent_harbor_signals(tf_df, t, args)
                     all_signals.extend(tf_signals)
 
-            # === HOTSPOT SCORING + FILTERING (unchanged) ===
+            # === HOTSPOT SCORING + FILTERING (v15.9.4 tighter for micro/macro) ===
             for sig in all_signals:
                 slope = sig.get('slope', 0)
                 if (sig['bias'] == 'long' and slope > 0) or (sig['bias'] == 'short' and slope < 0):
@@ -2079,20 +2381,24 @@ def run_live_mode(args):
                 else:
                     sig['hotspot_score'] = 0.0
 
+            # keep best signal PER (tf, bias, chain_type) → full 72-slot roster
             filtered = []
             for tf in LOWER_TFS + HIGHER_TFS:
                 for bias in ['long', 'short']:
-                    tf_bias = [s for s in all_signals
-                               if s.get('timeframe') == tf 
-                               and s.get('bias') == bias
-                               and s.get('hotspot_score', 0) >= 0]
-                    if not tf_bias:
-                        continue
-                    if tf in ['1m', '3m', '5m']:
-                        tf_bias.sort(key=lambda x: pd.to_datetime(x.get('nose_time') or x.get('born_on')), reverse=True)
-                    else:
-                        tf_bias.sort(key=lambda x: x.get('hotspot_score', 0), reverse=True)
-                    filtered.append(tf_bias[0])
+                    for chain in ['pico', 'nano', 'micro', 'macro']:
+                        min_hot = MIN_HOTSPOT_MICRO_MACRO if chain in ('micro', 'macro') else 0.0
+                        candidates = [s for s in all_signals
+                                      if s.get('timeframe') == tf
+                                      and s.get('bias') == bias
+                                      and s.get('chain_type', 'pico') == chain
+                                      and s.get('hotspot_score', 0) >= min_hot]
+                        if not candidates:
+                            continue
+                        if tf in ['1m', '3m', '5m']:
+                            candidates.sort(key=lambda x: pd.to_datetime(x.get('nose_time') or x.get('born_on')), reverse=True)
+                        else:
+                            candidates.sort(key=lambda x: x.get('hotspot_score', 0), reverse=True)
+                        filtered.append(candidates[0])
 
             if dev or verbose:
                 progress = f"\n[UTC {current_time.strftime('%H:%M:%S')}] Price ${current_market_price:,.0f} | "
@@ -2102,15 +2408,30 @@ def run_live_mode(args):
                 progress += f"| Active: {len(active_limits)}"
                 print(progress)
 
-            # === ORDER PLACEMENT LOOP (rest of your existing logic — unchanged) ===
+            # === ORDER PLACEMENT LOOP ===
+            # Global chain counts (for soft exposure cap)
+            chain_open = defaultdict(int)
+            for k, lim in active_limits.items():
+                chain_open[lim.get('chain_type', 'pico')] += 1
+
             placed_this_cycle = set()
             for sig in filtered:
                 tf = sig['timeframe']
                 bias = sig['bias']
-                key = f"{tf}_{bias}"
                 chain_type = sig.get('chain_type', 'pico')
+                key = f"{tf}_{bias}_{chain_type}"   # unique per chain → 8 slots/TF
 
-                # Basic age filter — made much more reactive for "every wick"
+                # ── Kill-switch gate ──
+                if current_ts < kill_switch_until:
+                    continue
+
+                # ── Soft per-chain exposure cap ──
+                if chain_open.get(chain_type, 0) >= MAX_OPEN_PER_CHAIN and key not in active_limits:
+                    if dev or verbose:
+                        print(f" → Skip {tf} {bias} {chain_type}: already {chain_open[chain_type]} open (cap {MAX_OPEN_PER_CHAIN})")
+                    continue
+
+                # Basic age filter — reactive for "every wick"
                 try:
                     born = pd.to_datetime(sig.get('born_on'))
                     if born.tz is None:
@@ -2119,11 +2440,11 @@ def run_live_mode(args):
                 except:
                     age_hours = 999
 
-                min_age = 0.3 if chain_type in ['pico', 'nano'] else 1.0   # <<< RELAXED
+                min_age = 0.3 if chain_type in ['pico', 'nano'] else 1.0
                 if age_hours < min_age:
                     continue
 
-                cooldown = 3 * 60 if tf in LOWER_TFS else 2 * 60          # <<< RELAXED
+                cooldown = 3 * 60 if tf in LOWER_TFS else 2 * 60
                 if current_ts - tf_data[tf]['last_flip_time'] < cooldown:
                     continue
 
@@ -2158,21 +2479,22 @@ def run_live_mode(args):
                     else:
                         continue
 
-                # === SAFE SIZING - Respect real balance ===
+                # === SIZING v15.9.5 — target 0.01 BTC @ 10× ===
                 capital = tf_data[tf]['capital']
-                real_balance = 371.70  # ← update this manually or pull from user_state
+                real_balance = live_equity if live_equity >= 1.0 else total_balance
 
                 zipper_score = zipper.get('zipper_score', 0)
-                roster_base = roster.get_recommended_size(capital, tf)
-
-                # Hard safety cap
-                risk_amount = min(capital * (MAX_RISK_PER_TF_PCT / 100.0), real_balance * 0.25)   # max 25% of total balance per TF
-                roster_base = risk_amount / current_market_price / max(LEVERAGE, 8)
-
-                max_size = MAX_POSITION_USD / current_market_price / LEVERAGE
-                raw_size = roster_base * sailfish_mult * (1.0 + zipper_score * 1.1)
-                size = max(round(raw_size, 5), 0.00100)   # 5 decimals for BTC
-                size = min(size, 0.003)   # safer for small capital
+                # Prefer fixed target size; scale down only if margin can't support it
+                needed_margin = TARGET_ORDER_SIZE_BTC * current_market_price / max(LEVERAGE, 1)
+                if real_balance >= needed_margin * 1.15:
+                    size = TARGET_ORDER_SIZE_BTC
+                else:
+                    # scale to what 25% of free equity allows at current leverage
+                    affordable = (real_balance * 0.25) * LEVERAGE / current_market_price
+                    size = max(round(min(TARGET_ORDER_SIZE_BTC, affordable), 5), 0.001)
+                # light zipper / sailfish nudge (never below target when funded)
+                size = min(size * (1.0 + zipper_score * 0.05) * max(sailfish_mult, 1.0), TARGET_ORDER_SIZE_BTC * 1.2)
+                size = round(min(size, 0.015), 5)
 
                 # Glide price
                 base_price = sig.get('leading_limit', sig.get('anchor2_price', current_market_price))
@@ -2225,30 +2547,32 @@ def run_live_mode(args):
                       f"Eighth@{sig.get('anchor2_price',0):.0f} @ {eighth_str} | "
                       f"Lead@{price:.2f} | Activated:False")
 
-                # === ROBUST MARGIN GUARD (DEV OVERRIDE) ===
+                # === MARGIN GUARD — use master account equity ===
                 try:
-                    user_state = exchange.info.user_state(address=wallet.address)
-                    account_value = float(user_state.get('marginSummary', {}).get('accountValue', 0))
-                    withdrawable = float(user_state.get('withdrawable', 0))
-                    free_margin = max(account_value, withdrawable, 50.0)   # ← force min $50 on testnet
-                    
+                    us_m = exchange.info.user_state(address=account_address)
+                    account_value = float(us_m.get('marginSummary', {}).get('accountValue', 0) or 0)
+                    withdrawable = float(us_m.get('withdrawable', 0) or 0)
+                    free_margin = max(account_value, withdrawable, live_equity, total_balance * 0.5)
                     print(f" → Margin check: Account ${account_value:,.2f} | Withdrawable ${withdrawable:,.2f} → Using ${free_margin:,.2f}")
-                    
-                    if free_margin < 50 and not dev:
-                        print(f" → Low margin (${free_margin:.2f}) — skipping order")
+                    # Need ~ (size * price / leverage) free; skip if clearly short
+                    needed = size * current_market_price / max(LEVERAGE, 1)
+                    if free_margin < needed * 0.9 and not dev:
+                        print(f" → Low margin (${free_margin:.2f} < need ~${needed:.2f}) — skipping order")
                         continue
                 except Exception as e:
-                    print(f" → Margin check failed ({e}) — using safe default $100")
-                    free_margin = 100.0
+                    print(f" → Margin check failed ({e}) — proceeding with size {size}")
+                    free_margin = total_balance
 
                 # Place order
                 if distance_pct < 0.0015:
-                    order_result = place_market_order(symbol, side_str, size, wallet)
+                    order_result = place_market_order(symbol, side_str, size, wallet,
+                                                     testnet=is_testnet, account_address=account_address)
                 else:
                     order_result = place_glide_limit_with_perturbation(
                         symbol=symbol, side=side_str, size=size,
                         calculated_glide_price=price, coin=coin,
-                        is_buy=(side_str.lower() == "buy")
+                        is_buy=(side_str.lower() == "buy"),
+                        wallet=wallet, testnet=is_testnet, account_address=account_address
                     )
 
                 if order_result:
@@ -2278,6 +2602,7 @@ def run_live_mode(args):
                     }
 
                     roster.allocate(tf, bias, chain_type, size * current_market_price, key)
+                    chain_open[chain_type] = chain_open.get(chain_type, 0) + 1
                     if dev or verbose:
                         print(f"[ROSTER ALLOCATED] {tf} {bias.upper()} {chain_type} | Slots used: {roster.get_total_allocated()}/72")
 
@@ -2313,12 +2638,15 @@ def run_live_mode(args):
                         del active_limits[k]
                 last_cleanup = current_ts
 
-            if active_limits:
-                print(f"\n📊 ACTIVE LIMITS: {len(active_limits)} | Roster: {roster.get_total_allocated()}/72 | Price ${current_market_price:,.0f}")
-            else:
-                print(f"\n📊 No active limits | Roster: {roster.get_total_allocated()}/72 | Price ${current_market_price:,.0f}")
+            ks_status = f"KILL {int(kill_switch_until - current_ts)}s" if current_ts < kill_switch_until else "OK"
+            chain_str = " ".join(f"{c}:{chain_open.get(c,0)}" for c in ['pico','nano','micro','macro'])
+            print(f"\n📊 ACTIVE: {len(active_limits)}/72 | Roster: {roster.get_total_allocated()} | "
+                  f"Eq ${live_equity:,.0f} | DD {session_dd_pct:.1f}% | Fees ${session_fees:.2f} | "
+                  f"NoseStops {nose_stops_this_session} | {ks_status} | Chains [{chain_str}] | "
+                  f"Price ${current_market_price:,.0f}")
 
-            export_state_json(active_limits, current_market_price, roster=roster, symbol=symbol)
+            export_state_json(active_limits, current_market_price,
+                              free_capital=live_equity, roster=roster, symbol=symbol)
             export_harbor_lines_json(active_limits, current_market_price, symbol=symbol)
             export_pine_ready(active_limits, current_market_price, symbol=symbol)
 
@@ -2333,7 +2661,7 @@ def run_live_mode(args):
 
 # ==================== MAIN ====================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Tetris + Topiary 15.1 - 4 Layer Harbor System")
+    parser = argparse.ArgumentParser(description="Tetris + Topiary v15.9.5 - 10x · 0.01 BTC · Reversals · ACT+1")
     parser.add_argument("--symbols", default="BTC/USDC")
     parser.add_argument("--timeframe", default="1m")
     parser.add_argument("--live", action="store_true")
